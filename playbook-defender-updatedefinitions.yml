@@ -1,3 +1,4 @@
+---
 - name: simpel as fuck
   ansible.builtin.shell:
     cmd: ls -l 
