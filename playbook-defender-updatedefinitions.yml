@@ -1,5 +1,6 @@
 ---
 - name: file module demo
+  hosts: all
   vars:
     myfile: "~/test.txt"
   tasks:
