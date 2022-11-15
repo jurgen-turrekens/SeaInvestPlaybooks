@@ -1,2 +1,2 @@
-- name: "Run a shell command on a remote host"
+- name: "Simpel shell commando als test"
   shell: ping -c1 www.fiets.nl
