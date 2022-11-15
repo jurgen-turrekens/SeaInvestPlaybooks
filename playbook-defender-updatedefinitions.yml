@@ -1,2 +1,4 @@
-- name: "Simpel shell commando als test"
-  shell: ping -c1 www.fiets.nl
+- name: simpel as fuck
+  ansible.builtin.shell:
+    cmd: ls -l 
+    chdir: /etc/
