@@ -1,8 +1,9 @@
 ---
-- name: simpel as fuck
+- name: file module demo
+  vars:
+    myfile: "~/test.txt"
   tasks:
-    - name shellcommand
-    ansible.builtin.shell:
-       cmd: ls -l 
-       chdir: /etc/
-       
+    - name: file
+      ansible.builtin.file:
+        path: "{{ myfile }}"
+        state: touch
