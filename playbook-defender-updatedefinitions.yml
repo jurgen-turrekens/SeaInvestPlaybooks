@@ -1,7 +1,7 @@
 ---
 - name: simpel as fuck
   tasks:
-    -name shellcommand
+    - name shellcommand
     ansible.builtin.shell:
        cmd: ls -l 
        chdir: /etc/
