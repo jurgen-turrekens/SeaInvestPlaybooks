@@ -1,5 +1,8 @@
 ---
 - name: simpel as fuck
-  ansible.builtin.shell:
-    cmd: ls -l 
-    chdir: /etc/
+  tasks:
+    -name shellcommand
+    ansible.builtin.shell:
+       cmd: ls -l 
+       chdir: /etc/
+       
