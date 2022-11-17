@@ -1,10 +1,12 @@
 ---
-- name: file module demo
+- name: Shell module example
   hosts: all
-  vars:
-    myfile: "~/test.txt"
   tasks:
-    - name: file
-      ansible.builtin.file:
-        path: "{{ myfile }}"
-        state: touch
+  
+  - name: Check system information
+    shell:
+    	"lsb_release -a"
+    register: os_info
+    
+  - debug:
+    	msg: "{{os_info.stdout_lines}}"
