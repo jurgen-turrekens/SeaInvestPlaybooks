@@ -2,6 +2,8 @@
 - name: update definitions
   hosts: all
   tasks:
-    - name: Check system information
+    - name: Update MD ATP definitions
       shell: mdatp definitions update
+    - name: Perform quick scan
+      shell: mdatp scan quick
       
