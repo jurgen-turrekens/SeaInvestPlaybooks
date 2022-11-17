@@ -2,7 +2,6 @@
 - name: update definitions
   hosts: all
   tasks:
-
-  - name: Check system information
-  shell:
-      "mdatp definitions update"
+    - name: Check system information
+      shell: mdatp definitions update
+      
