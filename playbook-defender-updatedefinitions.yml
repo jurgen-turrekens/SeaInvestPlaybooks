@@ -1,6 +1,6 @@
 ---
 - name: update definitions
-  hosts: all
+  hosts: vmadcappmycus01
   tasks:
     - name: Update MD ATP definitions
       shell: mdatp definitions update
