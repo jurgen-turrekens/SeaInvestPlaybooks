@@ -1,9 +1,9 @@
 ---
-- name: update definitions
-  hosts: vmadcappmycus01
+- name: update definitions and show health
+  hosts: all
   tasks:
     - name: Update MD ATP definitions
       shell: mdatp definitions update
-    - name: Perform quick scan
-      shell: mdatp scan quick
+    - name: mdatp healt check to output
+      shell: mdatp health
       
