@@ -1,9 +1,17 @@
 ---
-- name: update definitions and show health
+- name: Update definitions and show health
   hosts: all
   tasks:
-    - name: Update MD ATP definitions
-      shell: mdatp definitions update
-    - name: mdatp healt check to output
-      shell: mdatp health
-      
+    - name: Update MD ATP definitions and check health
+      shell: |
+        set -e
+        mdatp definitions update
+        mdatp health
+      args:
+        executable: /bin/bash
+      register: mdatp_health_output
+      changed_when: "'Definitions successfully updated' in mdatp_health_output.stdout"
+
+    - name: Display health check output
+      debug:
+        var: mdatp_health_output.stdout_lines
