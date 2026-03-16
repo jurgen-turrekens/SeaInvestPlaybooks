@@ -7,16 +7,16 @@
     
   tasks:
     - name: Copy onboarding package to target
-      copy:
-        src: "files/mdatp/{{ onboarding_package }}"
-        dest: "/tmp/{{ onboarding_package }}"
-        mode: '0644'
-        
-    - name: Extract onboarding package
-      unarchive:
-        src: "/tmp/{{ onboarding_package }}"
-        dest: "/tmp/"
-        remote_src: yes
+  copy:
+    src: "files/mdatp/WindowsDefenderATPOnboardingPackageLinux.zip"  
+    dest: "/tmp/WindowsDefenderATPOnboardingPackageLinux.zip"        
+    mode: '0644'
+
+- name: Extract onboarding package
+  unarchive:
+    src: "/tmp/WindowsDefenderATPOnboardingPackageLinux.zip"         
+    dest: "/tmp/"
+    remote_src: yes
         
     - name: Add Microsoft repository (Ubuntu/Debian)
       block:
