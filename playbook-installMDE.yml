@@ -68,11 +68,7 @@
       register: mdatp_health
       changed_when: false
 
-    - name: Show only important MDE health instead of blorb output
+    - name: Show available MDE health fields
       debug:
-        msg: |
-          MDE Status:
-          - Healthy: {{ (mdatp_health.stdout | from_json).healthy }}
-          - Licensed: {{ (mdatp_health.stdout | from_json).licensed }}
-          - Real-time protection: {{ (mdatp_health.stdout | from_json).real_time_protection_enabled }}
-          - Definitions updated: {{ (mdatp_health.stdout | from_json).definitions_updated }}
+        var: (mdatp_health.stdout | from_json)
+        
