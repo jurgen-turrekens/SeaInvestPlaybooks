@@ -1,0 +1,85 @@
+---
+- name: Register Debian VMs to Azure ARC
+  hosts: all
+  become: yes
+  vars:
+    subscription_id: "c8331b4b-2f4f-4a31-9af4-551023148ce7"
+    resource_group: "weu-p1-arc-silver-01"
+    tenant_id: "341459cf-af80-4c27-b62e-640f64d4ef71"
+    location: "westeurope"
+    cloud: "AzureCloud"
+    # Store these in Ansible Vault or environment variables
+    service_principal_id: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
+    service_principal_secret: "{{ lookup('env', 'AZURE_CLIENT_SECRET') }}"
+    
+  tasks:
+    - name: Generate correlation ID
+      set_fact:
+        correlation_id: "{{ 99999999 | random | to_uuid }}"
+
+    - name: Download Azure Connected Machine agent
+      get_url:
+        url: https://gbl.his.arc.azure.com/azcmagent-linux
+        dest: /tmp/install_linux_azcmagent.sh
+        mode: '0755'
+      register: download_result
+      failed_when: false
+
+    - name: Report download failure to Azure (if failed)
+      uri:
+        url: https://gbl.his.arc.azure.com/log
+        method: PUT
+        body_format: json
+        body:
+          subscriptionId: "{{ subscription_id }}"
+          resourceGroup: "{{ resource_group }}"
+          tenantId: "{{ tenant_id }}"
+          location: "{{ location }}"
+          correlationId: "{{ correlation_id }}"
+          authType: "principal"
+          operation: "onboarding"
+          messageType: "DownloadScriptFailed"
+          message: "{{ download_result.msg }}"
+      when: download_result.failed
+      failed_when: false
+
+    - name: Fail if download unsuccessful
+      fail:
+        msg: "Failed to download Azure Connected Machine agent"
+      when: download_result.failed
+
+    - name: Install Azure Connected Machine agent
+      command: bash /tmp/install_linux_azcmagent.sh
+      args:
+        creates: /opt/azcmagent/bin/azcmagent
+
+    - name: Check if machine is already connected
+      command: azcmagent show
+      register: azcmagent_status
+      failed_when: false
+      changed_when: false
+
+    - name: Connect machine to Azure ARC using Service Principal
+      command: >
+        azcmagent connect
+        --service-principal-id "{{ service_principal_id }}"
+        --service-principal-secret "{{ service_principal_secret }}"
+        --resource-group "{{ resource_group }}"
+        --tenant-id "{{ tenant_id }}"
+        --location "{{ location }}"
+        --subscription-id "{{ subscription_id }}"
+        --cloud "{{ cloud }}"
+        --correlation-id "{{ correlation_id }}"
+      when: azcmagent_status.rc != 0
+      register: connect_result
+      no_log: true  # Prevent secret from appearing in logs
+
+    - name: Display connection status
+      debug:
+        msg: "Azure ARC connection successful"
+      when: connect_result.changed or azcmagent_status.rc == 0
+
+    - name: Clean up installation script
+      file:
+        path: /tmp/install_linux_azcmagent.sh
+        state: absent
