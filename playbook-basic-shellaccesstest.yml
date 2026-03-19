@@ -1,6 +1,0 @@
----
-- name: shell access test
-  hosts: all
-  tasks:
-    - name: Update MD ATP definitions
-      shell: echo $USER
