@@ -3,25 +3,39 @@
   hosts: all
   become: yes
   vars:
-    subscription_id: "c8331b4b-2f4f-4a31-9af4-551023148ce7"
+    
+    subscription_id: "{{ lookup('env', 'AZURE_SUBSCRIPTION_ID') }}"
+    tenant_id: "{{ lookup('env', 'AZURE_TENANT') }}"
+    service_principal_id: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
+    service_principal_secret: "{{ lookup('env', 'AZURE_SECRET') }}"
+    
+    
     resource_group: "weu-p1-arc-silver-01"
-    tenant_id: "341459cf-af80-4c27-b62e-640f64d4ef71"
     location: "westeurope"
     cloud: "AzureCloud"
-    # Store these in Ansible Vault or environment variables
-    service_principal_id: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
-    service_principal_secret: "{{ lookup('env', 'AZURE_CLIENT_SECRET') }}"
+    correlation_id: 3ade8cb6-9c79-4aba-97f9-17e66f16b957
     
   tasks:
-    - name: Generate correlation ID
-      set_fact:
-        correlation_id: "{{ 99999999 | random | to_uuid }}"
-
+    - name: Verify Azure credentials are available
+      assert:
+        that:
+          - subscription_id is defined
+          - subscription_id | length > 0
+          - tenant_id is defined
+          - tenant_id | length > 0
+          - service_principal_id is defined
+          - service_principal_id | length > 0
+          - service_principal_secret is defined
+          - service_principal_secret | length > 0
+        fail_msg: "Azure credentials not properly injected. Ensure the Azure credential is attached to the job template."
+        success_msg: "Azure credentials verified successfully"
+   
     - name: Download Azure Connected Machine agent
       get_url:
         url: https://gbl.his.arc.azure.com/azcmagent-linux
         dest: /tmp/install_linux_azcmagent.sh
         mode: '0755'
+        timeout: 30
       register: download_result
       failed_when: false
 
@@ -39,25 +53,42 @@
           authType: "principal"
           operation: "onboarding"
           messageType: "DownloadScriptFailed"
-          message: "{{ download_result.msg }}"
+          message: "{{ download_result.msg | default('Download failed') }}"
+        status_code: [200, 201, 204]
       when: download_result.failed
       failed_when: false
+      no_log: true
 
     - name: Fail if download unsuccessful
       fail:
-        msg: "Failed to download Azure Connected Machine agent"
+        msg: "Failed to download Azure Connected Machine agent: {{ download_result.msg }}"
       when: download_result.failed
 
     - name: Install Azure Connected Machine agent
       command: bash /tmp/install_linux_azcmagent.sh
       args:
         creates: /opt/azcmagent/bin/azcmagent
+      register: install_result
 
-    - name: Check if machine is already connected
-      command: azcmagent show
+    - name: Verify azcmagent installation
+      command: which azcmagent
+      register: azcmagent_path
+      failed_when: false
+      changed_when: false
+
+    - name: Check if machine is already connected to Azure ARC
+      command: azcmagent show -j
       register: azcmagent_status
       failed_when: false
       changed_when: false
+
+    - name: Parse connection status
+      set_fact:
+        is_connected: "{{ (azcmagent_status.rc == 0) and ('Connected' in azcmagent_status.stdout) }}"
+
+    - name: Display current connection status
+      debug:
+        msg: "Machine {{ inventory_hostname }} is {{ 'already connected' if is_connected else 'not connected' }} to Azure ARC"
 
     - name: Connect machine to Azure ARC using Service Principal
       command: >
@@ -70,14 +101,28 @@
         --subscription-id "{{ subscription_id }}"
         --cloud "{{ cloud }}"
         --correlation-id "{{ correlation_id }}"
-      when: azcmagent_status.rc != 0
+      when: not is_connected
       register: connect_result
-      no_log: true  # Prevent secret from appearing in logs
+      no_log: true
+      failed_when: 
+        - connect_result.rc != 0
+        - "'already connected' not in connect_result.stderr | lower"
 
-    - name: Display connection status
+    - name: Verify connection after registration
+      command: azcmagent show -j
+      register: verify_status
+      when: connect_result.changed
+      changed_when: false
+
+    - name: Display final connection status
       debug:
-        msg: "Azure ARC connection successful"
-      when: connect_result.changed or azcmagent_status.rc == 0
+        msg: |
+          Azure ARC Registration Summary for {{ inventory_hostname }}:
+          - Status: {{ 'Successfully connected' if (connect_result.changed or is_connected) else 'Connection failed' }}
+          - Resource Group: {{ resource_group }}
+          - Location: {{ location }}
+          - Subscription: {{ subscription_id }}
+      when: connect_result.changed or is_connected
 
     - name: Clean up installation script
       file:
