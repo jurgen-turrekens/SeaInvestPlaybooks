@@ -10,7 +10,8 @@
   tasks:
 
     # -----------------------------
-    # Dependencies
+    # install script dependencies
+    # unzip for extraction of MDE installer package, python3 for onboarding script
     # -----------------------------
     - name: Ensure required packages are installed
       apt:
@@ -20,27 +21,21 @@
         state: present
         update_cache: yes
 
-    # -----------------------------
-    # Copy with recopy protection ✅
-    # -----------------------------
-    - name: Copy onboarding package to target (idempotent)
+    - name: Copy onboarding package to target 
       copy:
         src: "{{ mde_zip_src }}"
         dest: "{{ mde_zip_dest }}"
         mode: '0644'
       register: copy_result
 
-    # -----------------------------
-    # Ensure extract directory exists
-    # -----------------------------
     - name: Ensure extract directory exists
       file:
         path: "{{ mde_extract_path }}"
         state: directory
 
-    # -----------------------------
-    # Extract only when needed ✅
-    # -----------------------------
+    # --------------------------
+    # Extract only when needed; based on copy_result CRC change (new package, package not locally present 
+    # --------------------------
     - name: Extract onboarding package
       unarchive:
         src: "{{ mde_zip_dest }}"
@@ -48,27 +43,18 @@
         remote_src: yes
       when: copy_result.changed
 
-    # -----------------------------
-    # Run onboarding (modern method)
-    # -----------------------------
     - name: Run MDE onboarding script
       command: >
         python3 {{ mde_extract_path }}/WindowsDefenderATPOnboardingPackageLinux/MicrosoftDefenderATPOnboardingLinuxServer.py
       args:
         creates: /etc/opt/microsoft/mdatp/mdatp_onboard.json
-
-    # -----------------------------
-    # Enable realtime protection ✅
-    # -----------------------------
+    
     - name: Enable realtime protection
       command: mdatp config real-time-protection --value enabled
       register: realtime_result
       changed_when: "'enabled' in realtime_result.stdout.lower()"
       failed_when: false
-
-    # -----------------------------
-    # Ensure daily definition updates via cron ✅
-    # -----------------------------
+   
     - name: Ensure daily MDE definition update at midnight
       cron:
         name: "MDE definition update"
@@ -76,15 +62,17 @@
         minute: "0"
         hour: "0"
         user: root
-
-    # -----------------------------
-    # Verify status
-    # -----------------------------
-    - name: Check MDE health
-      command: mdatp health
+   
+    - name: Get MDE health (JSON)
+      command: mdatp health --output json
       register: mdatp_health
       changed_when: false
 
-    - name: Show MDE health
+    - name: Show only important MDE health instead of blorb output
       debug:
-        var: mdatp_health.stdout
+        msg: |
+          MDE Status:
+          - Healthy: {{ (mdatp_health.stdout | from_json).healthy }}
+          - Licensed: {{ (mdatp_health.stdout | from_json).licensed }}
+          - Real-time protection: {{ (mdatp_health.stdout | from_json).real_time_protection_enabled }}
+          - Definitions updated: {{ (mdatp_health.stdout | from_json).definitions_updated }}
