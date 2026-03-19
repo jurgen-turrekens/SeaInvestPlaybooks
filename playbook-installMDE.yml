@@ -13,6 +13,12 @@
         dest: "/tmp/WindowsDefenderATPOnboardingPackageLinux.zip"        
         mode: '0644'
 
+    - name: Ensure unzip is installed
+      apt:
+        name: unzip
+        state: present
+        update_cache: yes
+        
     - name: Extract onboarding package
       unarchive:
         src: "/tmp/WindowsDefenderATPOnboardingPackageLinux.zip"         
