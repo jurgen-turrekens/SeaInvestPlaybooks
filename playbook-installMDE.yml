@@ -63,12 +63,19 @@
         hour: "0"
         user: root
    
-    - name: Get MDE health (JSON)
+    - name: Get MDE health
       command: mdatp health --output json
       register: mdatp_health
       changed_when: false
 
-    - name: Show available MDE health fields
+    - name: Show only useful MDE health values in playbook debug output
+      vars:
+        health: "{{ mdatp_health.stdout | from_json }}"
       debug:
-        var: (mdatp_health.stdout | from_json)
+        msg: |
+          MDE Status:
+          - Healthy: {{ health.healthy }}
+          - Real-time protection: {{ health.realTimeProtectionEnabled.value }}
+          - Definitions status: {{ health.definitionsStatus['$type'] }}
+        
         
