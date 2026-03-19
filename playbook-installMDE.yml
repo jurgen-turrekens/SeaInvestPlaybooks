@@ -53,7 +53,7 @@
         state: present
         
     - name: Onboard device
-      command: mdatp onboard /tmp/onboarding.json
+      command: mdatp onboard /tmp/mdatp_onboard.json
       register: onboard_result
       
     - name: Verify onboarding
@@ -70,4 +70,4 @@
         state: absent
       loop:
         - "/tmp/{{ onboarding_package }}"
-        - "/tmp/onboarding.json"
+        - "/tmp/mdatp_onboard.json"
