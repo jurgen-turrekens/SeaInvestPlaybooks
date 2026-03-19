@@ -1,73 +1,65 @@
----
-
-- name: Deploy Microsoft Defender for Endpoint
+- name: Install and onboard Microsoft Defender for Endpoint (Debian)
   hosts: all
   become: yes
+
   vars:
-    onboarding_package: "WindowsDefenderATPOnboardingPackage.zip"
-    
+    mde_zip_src: "files/mdatp/WindowsDefenderATPOnboardingPackageLinux.zip"
+    mde_zip_dest: "/tmp/mde_onboarding.zip"
+    mde_extract_path: "/tmp/mde_onboarding"
+
   tasks:
+
+    # -----------------------------
+    # Dependencies
+    # -----------------------------
+    - name: Ensure required packages are installed
+      apt:
+        name:
+          - unzip
+          - python3
+        state: present
+        update_cache: yes
+
+    # -----------------------------
+    # Copy onboarding package from repo
+    # -----------------------------
     - name: Copy onboarding package to target
       copy:
-        src: "files/mdatp/WindowsDefenderATPOnboardingPackageLinux.zip"  
-        dest: "/tmp/WindowsDefenderATPOnboardingPackageLinux.zip"        
+        src: "{{ mde_zip_src }}"
+        dest: "{{ mde_zip_dest }}"
         mode: '0644'
 
-    - name: Ensure unzip is installed
-      apt:
-        name: unzip
-        state: present
-        update_cache: yes
-        
+    # -----------------------------
+    # Extract package
+    # -----------------------------
+    - name: Ensure extract directory exists
+      file:
+        path: "{{ mde_extract_path }}"
+        state: directory
+
     - name: Extract onboarding package
       unarchive:
-        src: "/tmp/WindowsDefenderATPOnboardingPackageLinux.zip"         
-        dest: "/tmp/"
+        src: "{{ mde_zip_dest }}"
+        dest: "{{ mde_extract_path }}"
         remote_src: yes
-        
-    - name: Add Microsoft repository (Ubuntu/Debian)
-      block:
-        - name: Download Microsoft repository list
-          get_url:
-            url: "https://packages.microsoft.com/config/ubuntu/{{ ansible_distribution_version }}/prod.list"
-            dest: "/tmp/microsoft.list"
-            
-        - name: Move repository list to sources
-          copy:
-            src: "/tmp/microsoft.list"
-            dest: "/etc/apt/sources.list.d/microsoft-prod.list"
-            remote_src: yes
-            
-        - name: Add Microsoft GPG key
-          apt_key:
-            url: "https://packages.microsoft.com/keys/microsoft.asc"
-            state: present
-            
-    - name: Update package cache
-      apt:
-        update_cache: yes
-        
-    - name: Install MDATP
-      apt:
-        name: mdatp
-        state: present
-        
-    - name: Onboard device
-      command: mdatp onboard /tmp/mdatp_onboard.json
-      register: onboard_result
-      
-    - name: Verify onboarding
-      command: mdatp health --field org_id
-      register: health_check
-      
-    - name: Display onboarding status
+
+    # -----------------------------
+    # Run onboarding (✅ modern method)
+    # -----------------------------
+    - name: Run MDE onboarding script
+      command: >
+        python3 {{ mde_extract_path }}/WindowsDefenderATPOnboardingPackageLinux/MicrosoftDefenderATPOnboardingLinuxServer.py
+      args:
+        creates: /etc/opt/microsoft/mdatp/mdatp_onboard.json
+
+    # -----------------------------
+    # Verify
+    # -----------------------------
+    - name: Check MDE health
+      command: mdatp health
+      register: mdatp_health
+      changed_when: false
+
+    - name: Show MDE health
       debug:
-        msg: "Organization ID: {{ health_check.stdout }}"
-        
-    - name: Clean up temporary files
-      file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - "/tmp/{{ onboarding_package }}"
-        - "/tmp/mdatp_onboard.json"
+        var: mdatp_health.stdout
