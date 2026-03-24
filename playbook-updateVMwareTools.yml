@@ -1,0 +1,31 @@
+---
+- name: Update VMware Tools 
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      register: apt_update
+      
+    - name: Upgrade open-vm-tools packages
+      apt:
+        name:
+          - open-vm-tools
+          - open-vm-tools-sdmp
+        state: latest
+        only_upgrade: yes
+      register: vmtools_upgrade
+
+    - name: Display VMware tools upgrade results
+      debug:
+        msg: "VMware tools packages upgraded: {{ vmtools_upgrade.changed }}"
+
+    - name: Restart open-vm-tools service if upgraded
+      systemd:
+        name: open-vm-tools
+        state: restarted
+      when: vmtools_upgrade.changed
