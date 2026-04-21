@@ -15,10 +15,65 @@
           - libplist-utils
           - gpg
           - apt-transport-https
+          - lsb-release
         state: present
         update_cache: yes
 
-    # Add Microsoft repository
+    # Cleanup any existing conflicting Microsoft repositories
+    - name: Check for existing Microsoft repository files
+      find:
+        paths: /etc/apt/sources.list.d/
+        patterns: "microsoft*.list"
+      register: existing_ms_repos
+
+    - name: Remove existing Microsoft repository files to avoid conflicts
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ existing_ms_repos.files }}"
+      when: existing_ms_repos.files | length > 0
+
+    - name: Remove old GPG keys to avoid conflicts
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/share/keyrings/microsoft-prod.gpg
+        - /etc/apt/keyrings/microsoft.gpg
+        - /etc/apt/trusted.gpg.d/microsoft.gpg
+
+    # Detect OS properly
+    - name: Detect OS distribution
+      shell: lsb_release -is | tr '[:upper:]' '[:lower:]'
+      register: os_distribution
+      changed_when: false
+
+    - name: Detect Ubuntu version
+      shell: lsb_release -rs
+      register: ubuntu_version_raw
+      changed_when: false
+
+    - name: Detect Ubuntu codename
+      shell: lsb_release -cs
+      register: ubuntu_codename
+      changed_when: false
+
+    - name: Validate Ubuntu version and set repository URL
+      set_fact:
+        ubuntu_version: "{{ ubuntu_version_raw.stdout }}"
+        is_ubuntu: "{{ os_distribution.stdout == 'ubuntu' }}"
+
+    - name: Fail if not Ubuntu
+      fail:
+        msg: "This playbook only supports Ubuntu. Detected: {{ os_distribution.stdout }}"
+      when: not is_ubuntu
+
+    - name: Fail if unsupported Ubuntu version
+      fail:
+        msg: "Unsupported Ubuntu version: {{ ubuntu_version }}. Only 20.04, 22.04, and 24.04 are supported."
+      when: ubuntu_version not in ['20.04', '22.04', '24.04']
+
+    # Add Microsoft repository with proper error handling
     - name: Create keyrings directory
       file:
         path: /etc/apt/keyrings
@@ -29,28 +84,24 @@
       shell: |
         curl -sSL https://packages.microsoft.com/keys/microsoft.asc | \
         gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+        chmod 644 /etc/apt/keyrings/microsoft.gpg
       args:
         creates: /etc/apt/keyrings/microsoft.gpg
 
-    - name: Detect Ubuntu version
-      shell: lsb_release -rs
-      register: ubuntu_version
-      changed_when: false
-
-    - name: Detect Ubuntu codename
-      shell: lsb_release -cs
-      register: ubuntu_codename
-      changed_when: false
-
     - name: Add Microsoft Defender for Endpoint repository
       apt_repository:
-        repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/{{ ubuntu_version.stdout }}/prod {{ ubuntu_codename.stdout }} main"
+        repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/{{ ubuntu_version }}/prod {{ ubuntu_codename.stdout }} main"
         filename: microsoft-prod
         state: present
+        update_cache: no
 
-    - name: Update apt cache after adding repository
+    - name: Update apt cache with error handling
       apt:
         update_cache: yes
+      register: apt_update
+      retries: 3
+      delay: 5
+      until: apt_update is success
 
     # Install MDATP
     - name: Install Microsoft Defender for Endpoint
