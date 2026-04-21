@@ -19,28 +19,53 @@
         state: present
         update_cache: yes
 
-    # Cleanup any existing conflicting Microsoft repositories
-    - name: Check for existing Microsoft repository files
+    # AGGRESSIVE CLEANUP - Remove ALL Microsoft repository references
+    - name: Find all apt source files
       find:
-        paths: /etc/apt/sources.list.d/
-        patterns: "microsoft*.list"
-      register: existing_ms_repos
+        paths:
+          - /etc/apt/sources.list.d/
+        patterns: "*.list"
+      register: all_source_files
 
-    - name: Remove existing Microsoft repository files to avoid conflicts
+    - name: Remove Microsoft repository entries from sources.list.d files
+      lineinfile:
+        path: "{{ item.path }}"
+        regexp: '.*packages\.microsoft\.com.*'
+        state: absent
+      loop: "{{ all_source_files.files }}"
+      when: all_source_files.files | length > 0
+
+    - name: Remove Microsoft repository entries from main sources.list
+      lineinfile:
+        path: /etc/apt/sources.list
+        regexp: '.*packages\.microsoft\.com.*'
+        state: absent
+
+    - name: Remove any Microsoft-specific list files entirely
       file:
         path: "{{ item.path }}"
         state: absent
-      loop: "{{ existing_ms_repos.files }}"
-      when: existing_ms_repos.files | length > 0
+      loop: "{{ all_source_files.files }}"
+      when: 
+        - all_source_files.files | length > 0
+        - "'microsoft' in item.path | lower"
 
-    - name: Remove old GPG keys to avoid conflicts
+    - name: Remove all Microsoft GPG keys from all locations
       file:
         path: "{{ item }}"
         state: absent
       loop:
         - /usr/share/keyrings/microsoft-prod.gpg
+        - /usr/share/keyrings/microsoft.gpg
         - /etc/apt/keyrings/microsoft.gpg
+        - /etc/apt/keyrings/microsoft-prod.gpg
         - /etc/apt/trusted.gpg.d/microsoft.gpg
+        - /etc/apt/trusted.gpg.d/microsoft-prod.gpg
+
+    - name: Update apt cache after cleanup
+      apt:
+        update_cache: yes
+      ignore_errors: yes
 
     # Detect OS properly
     - name: Detect OS distribution
@@ -73,14 +98,14 @@
         msg: "Unsupported Ubuntu version: {{ ubuntu_version }}. Only 20.04, 22.04, and 24.04 are supported."
       when: ubuntu_version not in ['20.04', '22.04', '24.04']
 
-    # Add Microsoft repository with proper error handling
+    # Add Microsoft repository cleanly
     - name: Create keyrings directory
       file:
         path: /etc/apt/keyrings
         state: directory
         mode: '0755'
 
-    - name: Download and install Microsoft GPG key
+    - name: Download and install Microsoft GPG key to standard location
       shell: |
         curl -sSL https://packages.microsoft.com/keys/microsoft.asc | \
         gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
@@ -88,12 +113,12 @@
       args:
         creates: /etc/apt/keyrings/microsoft.gpg
 
-    - name: Add Microsoft Defender for Endpoint repository
-      apt_repository:
-        repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/{{ ubuntu_version }}/prod {{ ubuntu_codename.stdout }} main"
-        filename: microsoft-prod
-        state: present
-        update_cache: no
+    - name: Create Microsoft repository file manually
+      copy:
+        dest: /etc/apt/sources.list.d/microsoft-prod.list
+        content: |
+          deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/{{ ubuntu_version }}/prod {{ ubuntu_codename.stdout }} main
+        mode: '0644'
 
     - name: Update apt cache with error handling
       apt:
