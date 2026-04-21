@@ -1,0 +1,49 @@
+- name: Cleanup Microsoft Repository Conflicts
+  hosts: all
+  become: yes
+
+  tasks:
+    - name: Remove Microsoft repository entries from main sources.list
+      lineinfile:
+        path: /etc/apt/sources.list
+        regexp: '.*packages\.microsoft\.com.*'
+        state: absent
+
+    - name: Find all apt source list files
+      find:
+        paths: /etc/apt/sources.list.d/
+        patterns: "*.list"
+      register: source_files
+
+    - name: Remove Microsoft repository entries from all source files
+      lineinfile:
+        path: "{{ item.path }}"
+        regexp: '.*packages\.microsoft\.com.*'
+        state: absent
+      loop: "{{ source_files.files }}"
+      when: source_files.files | length > 0
+
+    - name: Remove Microsoft-specific list files
+      shell: rm -f /etc/apt/sources.list.d/microsoft*.list
+      args:
+        warn: false
+
+    - name: Remove all Microsoft GPG keys
+      shell: |
+        rm -f /usr/share/keyrings/microsoft*.gpg
+        rm -f /etc/apt/keyrings/microsoft*.gpg
+        rm -f /etc/apt/trusted.gpg.d/microsoft*.gpg
+      args:
+        warn: false
+
+    - name: Clean apt cache
+      command: apt clean
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+      ignore_errors: yes
+
+    - name: Display cleanup completion message
+      debug:
+        msg: "Microsoft repository cleanup complete. Ready for fresh installation."
