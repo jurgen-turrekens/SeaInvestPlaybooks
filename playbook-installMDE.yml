@@ -1,81 +1,117 @@
-- name: Install and onboard Microsoft Defender for Endpoint (Debian)
+- name: Install and onboard Microsoft Defender for Endpoint (Ubuntu)
   hosts: all
   become: yes
 
   vars:
-    mde_zip_src: "files/mdatp/WindowsDefenderATPOnboardingPackageLinux.zip"
-    mde_zip_dest: "/tmp/mde_onboarding.zip"
+    mde_zip_src: "files/mdatp/WindowsDefenderATPOnboardingPackage.zip"
     mde_extract_path: "/tmp/mde_onboarding"
 
   tasks:
-
-    # -----------------------------
-    # install script dependencies
-    # unzip for extraction of MDE installer package, python3 for onboarding script
-    # -----------------------------
-    - name: Ensure required packages are installed
+    # Prerequisites
+    - name: Install required packages
       apt:
         name:
-          - unzip
-          - python3
+          - curl
+          - libplist-utils
+          - gpg
+          - apt-transport-https
         state: present
         update_cache: yes
 
-    - name: Copy onboarding package to target 
-      copy:
-        src: "{{ mde_zip_src }}"
-        dest: "{{ mde_zip_dest }}"
-        mode: '0644'
-      register: copy_result
+    # Add Microsoft repository
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
 
-    - name: Ensure extract directory exists
+    - name: Download and install Microsoft GPG key
+      shell: |
+        curl -sSL https://packages.microsoft.com/keys/microsoft.asc | \
+        gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+      args:
+        creates: /etc/apt/keyrings/microsoft.gpg
+
+    - name: Detect Ubuntu version
+      shell: lsb_release -rs
+      register: ubuntu_version
+      changed_when: false
+
+    - name: Detect Ubuntu codename
+      shell: lsb_release -cs
+      register: ubuntu_codename
+      changed_when: false
+
+    - name: Add Microsoft Defender for Endpoint repository
+      apt_repository:
+        repo: "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/{{ ubuntu_version.stdout }}/prod {{ ubuntu_codename.stdout }} main"
+        filename: microsoft-prod
+        state: present
+
+    - name: Update apt cache after adding repository
+      apt:
+        update_cache: yes
+
+    # Install MDATP
+    - name: Install Microsoft Defender for Endpoint
+      apt:
+        name: mdatp
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    # Onboarding
+    - name: Create MDE onboarding directory
       file:
         path: "{{ mde_extract_path }}"
         state: directory
+        mode: '0755'
 
-    # --------------------------
-    # Extract only when needed; based on copy_result CRC change (new package, package not locally present 
-    # --------------------------
-    - name: Extract onboarding package
+    - name: Copy onboarding package to target
+      copy:
+        src: "{{ mde_zip_src }}"
+        dest: "{{ mde_extract_path }}/WindowsDefenderATPOnboardingPackage.zip"
+        mode: '0644'
+
+    - name: Unzip the onboarding package
       unarchive:
-        src: "{{ mde_zip_dest }}"
-        dest: "{{ mde_extract_path }}"
+        src: "{{ mde_extract_path }}/WindowsDefenderATPOnboardingPackage.zip"
+        dest: "{{ mde_extract_path }}/"
         remote_src: yes
-      when: copy_result.changed
 
     - name: Run MDE onboarding script
       command: >
         python3 {{ mde_extract_path }}/MicrosoftDefenderATPOnboardingLinuxServer.py
       args:
         creates: /etc/opt/microsoft/mdatp/mdatp_onboard.json
-    
-    - name: Enable realtime protection
-      command: mdatp config real-time-protection --value enabled
-      register: realtime_result
-      changed_when: "'enabled' in realtime_result.stdout.lower()"
-      failed_when: false
-   
-    - name: Ensure daily MDE definition update at midnight
-      cron:
-        name: "MDE definition update"
-        job: "/usr/bin/mdatp definitions update"
-        minute: "0"
-        hour: "0"
-        user: root
-   
-    - name: Get MDE health
-      command: mdatp health --output json
+
+    # Verification
+    - name: Wait for MDATP service to initialize
+      pause:
+        seconds: 10
+
+    - name: Check MDATP health status
+      command: mdatp health --field healthy
       register: mdatp_health
       changed_when: false
+      failed_when: false
 
-    - name: Show only useful MDE health values in playbook debug output
-      vars:
-        health: "{{ mdatp_health.stdout | from_json }}"
+    - name: Display MDATP health status
       debug:
-        msg: |
-          MDE Status:
-          - Healthy: {{ health.healthy }}
-          - Real-time protection: {{ health.realTimeProtectionEnabled.value }}
-          - Definitions status: {{ health.definitionsStatus['$type'] }}
-        
-        
+        msg: "MDATP Health Status: {{ mdatp_health.stdout }}"
+
+    - name: Check MDATP version
+      command: mdatp version
+      register: mdatp_version
+      changed_when: false
+      failed_when: false
+
+    - name: Display MDATP version
+      debug:
+        msg: "MDATP Version: {{ mdatp_version.stdout }}"
+
+    # Cleanup
+    - name: Remove temporary onboarding files
+      file:
+        path: "{{ mde_extract_path }}"
+        state: absent
