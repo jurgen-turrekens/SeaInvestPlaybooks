@@ -23,21 +23,61 @@
       loop: "{{ source_files.files }}"
       when: source_files.files | length > 0
 
-    - name: Remove Microsoft-specific list files
-      shell: rm -f /etc/apt/sources.list.d/microsoft*.list
-      args:
-        warn: false
+    - name: Find Microsoft-specific list files
+      find:
+        paths: /etc/apt/sources.list.d/
+        patterns: "microsoft*.list"
+      register: microsoft_files
 
-    - name: Remove all Microsoft GPG keys
-      shell: |
-        rm -f /usr/share/keyrings/microsoft*.gpg
-        rm -f /etc/apt/keyrings/microsoft*.gpg
-        rm -f /etc/apt/trusted.gpg.d/microsoft*.gpg
-      args:
-        warn: false
+    - name: Remove Microsoft-specific list files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ microsoft_files.files }}"
+      when: microsoft_files.files | length > 0
+
+    - name: Remove Microsoft GPG keys from /usr/share/keyrings/
+      find:
+        paths: /usr/share/keyrings/
+        patterns: "microsoft*.gpg"
+      register: gpg_keys_usr
+
+    - name: Delete GPG keys from /usr/share/keyrings/
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ gpg_keys_usr.files }}"
+      when: gpg_keys_usr.files | length > 0
+
+    - name: Remove Microsoft GPG keys from /etc/apt/keyrings/
+      find:
+        paths: /etc/apt/keyrings/
+        patterns: "microsoft*.gpg"
+      register: gpg_keys_etc
+
+    - name: Delete GPG keys from /etc/apt/keyrings/
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ gpg_keys_etc.files }}"
+      when: gpg_keys_etc.files | length > 0
+
+    - name: Remove Microsoft GPG keys from /etc/apt/trusted.gpg.d/
+      find:
+        paths: /etc/apt/trusted.gpg.d/
+        patterns: "microsoft*.gpg"
+      register: gpg_keys_trusted
+
+    - name: Delete GPG keys from /etc/apt/trusted.gpg.d/
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ gpg_keys_trusted.files }}"
+      when: gpg_keys_trusted.files | length > 0
 
     - name: Clean apt cache
       command: apt clean
+      changed_when: false
 
     - name: Update apt cache
       apt:
