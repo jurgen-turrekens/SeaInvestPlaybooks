@@ -45,7 +45,7 @@
 
     - name: Run MDE onboarding script
       command: >
-        python3 {{ mde_extract_path }}/WindowsDefenderATPOnboardingPackageLinux/MicrosoftDefenderATPOnboardingLinuxServer.py
+        python3 {{ mde_extract_path }}/MicrosoftDefenderATPOnboardingLinuxServer.py
       args:
         creates: /etc/opt/microsoft/mdatp/mdatp_onboard.json
     
