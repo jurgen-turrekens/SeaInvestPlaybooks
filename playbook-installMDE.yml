@@ -10,14 +10,49 @@
   tasks:
 
     # -----------------------------
-    # install script dependencies
+    # Add Microsoft repository
+    # Required to install mdatp from official MS repo
+    # -----------------------------
+    - name: Add Microsoft repository GPG key
+      apt_key:
+        keyserver: keyserver.ubuntu.com
+        id: BC528686B50D79E339D3721CEB3E94ADBE1229CF
+        state: present
+      ignore_errors: yes
+
+    - name: Update package cache after adding GPG key
+      apt:
+        update_cache: yes
+      ignore_errors: yes
+
+    - name: Install Microsoft GPG key via direct download
+      shell: |
+        wget -q https://packages.microsoft.com/keys/microsoft.asc -O /tmp/microsoft.asc
+        apt-key add /tmp/microsoft.asc
+      ignore_errors: yes
+
+    - name: Add Microsoft Defender for Endpoint repository
+      apt_repository:
+        repo: "deb [arch=amd64,arm64,armhf] https://packages.microsoft.com/ubuntu/{{ ansible_distribution_version }}/prod {{ ansible_distribution_release }} main"
+        state: present
+        filename: microsoft-prod
+      ignore_errors: yes
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+
+    # -----------------------------
+    # install script dependencies and mdatp from Microsoft repo
     # unzip for extraction of MDE installer package, python3 for onboarding script
+    # mdatp installed from official Microsoft repository
     # -----------------------------
     - name: Ensure required packages are installed
       apt:
         name:
           - unzip
           - python3
+          - mdatp
         state: present
         update_cache: yes
 
