@@ -29,3 +29,17 @@
         name: open-vm-tools
         state: restarted
       when: vmtools_upgrade.changed
+
+    - name: Get installed VMware Tools version
+      shell: vmtoolsd --version
+      register: vmtools_version
+      changed_when: false
+
+    - name: Display installed VMware Tools version
+      debug:
+        msg: |
+          ========================================
+          VMware Tools Installation Summary
+          ========================================
+          {{ vmtools_version.stdout }}
+          ========================================
