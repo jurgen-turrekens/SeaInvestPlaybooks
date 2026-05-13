@@ -3,87 +3,143 @@
   become: yes
 
   tasks:
+    # Debian/Ubuntu cleanup
     - name: Remove Microsoft repository entries from main sources.list
       lineinfile:
         path: /etc/apt/sources.list
         regexp: '.*packages\.microsoft\.com.*'
         state: absent
+      when: ansible_os_family == "Debian"
 
     - name: Find all apt source list files
       find:
         paths: /etc/apt/sources.list.d/
         patterns: "*.list"
       register: source_files
+      when: ansible_os_family == "Debian"
 
-    - name: Remove Microsoft repository entries from all source files
+    - name: Remove Microsoft repository entries from all Debian source files
       lineinfile:
         path: "{{ item.path }}"
         regexp: '.*packages\.microsoft\.com.*'
         state: absent
       loop: "{{ source_files.files }}"
-      when: source_files.files | length > 0
+      when: ansible_os_family == "Debian" and source_files.files | length > 0
 
     - name: Find Microsoft-specific list files
       find:
         paths: /etc/apt/sources.list.d/
         patterns: "microsoft*.list"
       register: microsoft_files
+      when: ansible_os_family == "Debian"
 
     - name: Remove Microsoft-specific list files
       file:
         path: "{{ item.path }}"
         state: absent
       loop: "{{ microsoft_files.files }}"
-      when: microsoft_files.files | length > 0
+      when: ansible_os_family == "Debian" and microsoft_files.files | length > 0
 
+    # RHEL/CentOS/Fedora cleanup
+    - name: Remove Microsoft repository entries from yum/dnf
+      shell: |
+        for repo in /etc/yum.repos.d/microsoft*.repo; do
+          if [ -f "$repo" ]; then
+            rm "$repo"
+          fi
+        done
+      changed_when: false
+      when: ansible_os_family == "RedHat"
+
+    # SUSE cleanup
+    - name: Remove Microsoft repository entries from zypper
+      shell: |
+        for repo in /etc/zypp/repos.d/microsoft*.repo; do
+          if [ -f "$repo" ]; then
+            rm "$repo"
+          fi
+        done
+      changed_when: false
+      when: ansible_os_family == "Suse"
+
+    # GPG keys cleanup (common to Debian)
     - name: Remove Microsoft GPG keys from /usr/share/keyrings/
       find:
         paths: /usr/share/keyrings/
         patterns: "microsoft*.gpg"
       register: gpg_keys_usr
+      when: ansible_os_family == "Debian"
 
     - name: Delete GPG keys from /usr/share/keyrings/
       file:
         path: "{{ item.path }}"
         state: absent
       loop: "{{ gpg_keys_usr.files }}"
-      when: gpg_keys_usr.files | length > 0
+      when: ansible_os_family == "Debian" and gpg_keys_usr.files | length > 0
 
     - name: Remove Microsoft GPG keys from /etc/apt/keyrings/
       find:
         paths: /etc/apt/keyrings/
         patterns: "microsoft*.gpg"
       register: gpg_keys_etc
+      when: ansible_os_family == "Debian"
 
     - name: Delete GPG keys from /etc/apt/keyrings/
       file:
         path: "{{ item.path }}"
         state: absent
       loop: "{{ gpg_keys_etc.files }}"
-      when: gpg_keys_etc.files | length > 0
+      when: ansible_os_family == "Debian" and gpg_keys_etc.files | length > 0
 
     - name: Remove Microsoft GPG keys from /etc/apt/trusted.gpg.d/
       find:
         paths: /etc/apt/trusted.gpg.d/
         patterns: "microsoft*.gpg"
       register: gpg_keys_trusted
+      when: ansible_os_family == "Debian"
 
     - name: Delete GPG keys from /etc/apt/trusted.gpg.d/
       file:
         path: "{{ item.path }}"
         state: absent
       loop: "{{ gpg_keys_trusted.files }}"
-      when: gpg_keys_trusted.files | length > 0
+      when: ansible_os_family == "Debian" and gpg_keys_trusted.files | length > 0
 
+    # Package cache cleanup
     - name: Clean apt cache
       command: apt clean
       changed_when: false
+      when: ansible_os_family == "Debian"
 
+    - name: Clean yum/dnf cache
+      command: "{{ 'dnf clean all' if ansible_distribution_major_version | int >= 22 else 'yum clean all' }}"
+      changed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: Clean zypper cache
+      command: zypper clean
+      changed_when: false
+      when: ansible_os_family == "Suse"
+
+    # Update package cache
     - name: Update apt cache
       apt:
         update_cache: yes
       ignore_errors: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Update yum/dnf cache
+      command: "{{ 'dnf makecache' if ansible_distribution_major_version | int >= 22 else 'yum makecache' }}"
+      changed_when: false
+      ignore_errors: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: Update zypper cache
+      command: zypper refresh
+      changed_when: false
+      ignore_errors: yes
+      when: ansible_os_family == "Suse"
 
     - name: Display cleanup completion message
       debug:
-        msg: "Microsoft repository cleanup complete. Ready for fresh installation."
+        msg: "Microsoft repository cleanup complete for {{ ansible_os_family }}. Ready for fresh installation."
