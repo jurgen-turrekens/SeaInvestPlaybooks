@@ -1,0 +1,29 @@
+---
+- name: MDE Status
+  hosts: all
+  become: true
+  gather_facts: false
+ 
+  tasks:
+ 
+    - name: Get platform version
+      ansible.builtin.command: mdatp health --field app_version
+      register: platform_version
+      changed_when: false
+ 
+    - name: Get definitions version
+      ansible.builtin.command: mdatp health --field definitions_version
+      register: definitions_version
+      changed_when: false
+ 
+    - name: Get definitions status
+      ansible.builtin.command: mdatp health --field definitions_status
+      register: definitions_status
+      changed_when: false
+ 
+    - name: MDE Status
+      ansible.builtin.debug:
+        msg:
+          - "Host        : {{ inventory_hostname }}"
+          - "Platform    : {{ platform_version.stdout }}"
+          - "Definitions : {{ definitions_version.stdout }} ({{ definitions_status.stdout }})"
