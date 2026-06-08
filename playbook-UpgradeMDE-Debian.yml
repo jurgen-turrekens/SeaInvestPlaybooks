@@ -1,0 +1,79 @@
+---
+
+# Fixes Microsoft Defender for Endpoint GPG key and apt repository on Debian 11 (bullseye) hosts,
+# pointing them to the Debian 12 (bookworm) repo to receive up-to-date MDE builds.
+
+- name: Fix MDE apt key and repository
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    mde_key_url: "https://packages.microsoft.com/keys/microsoft.asc"
+    mde_key_dest: "/usr/share/keyrings/microsoft-prod.gpg"
+    mde_repo_url: "https://packages.microsoft.com/config/debian/12/prod.list"
+    mde_repo_dest: "/etc/apt/sources.list.d/microsoft-prod.list"
+
+  tasks:
+
+    - name: Ensure gnupg and curl are installed
+      apt:
+        name:
+          - gnupg
+          - curl
+        state: present
+        update_cache: false
+
+    - name: Remove legacy MDE GPG key from trusted.gpg.d (if present)
+      file:
+        path: "/etc/apt/trusted.gpg.d/{{ item }}"
+        state: absent
+      loop:
+        - microsoft.gpg
+        - microsoft-prod.gpg
+
+    - name: Download and install Microsoft GPG key to /usr/share/keyrings
+      shell: |
+        curl -fsSL {{ mde_key_url }} | gpg --dearmor -o {{ mde_key_dest }}
+      args:
+        creates: "{{ mde_key_dest }}"
+
+    - name: Ensure GPG key is world-readable
+      file:
+        path: "{{ mde_key_dest }}"
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Configure MDE apt repository (Debian 12/bookworm channel)
+      get_url:
+        url: "{{ mde_repo_url }}"
+        dest: "{{ mde_repo_dest }}"
+        mode: "0644"
+        owner: root
+        group: root
+        force: true
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+
+    - name: Upgrade mdatp to latest available version
+      apt:
+        name: mdatp
+        state: latest
+      register: mdatp_upgrade
+
+    - name: Report upgrade result
+      debug:
+        msg: "{{ 'mdatp was upgraded' if mdatp_upgrade.changed else 'mdatp already at latest version' }}"
+
+    - name: Check MDE health status
+      command: mdatp health --field healthy
+      register: mde_health
+      changed_when: false
+      failed_when: false
+
+    - name: Report MDE health
+      debug:
+        msg: "MDE health: {{ mde_health.stdout }}"
