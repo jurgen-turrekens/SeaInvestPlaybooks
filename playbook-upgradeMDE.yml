@@ -1,0 +1,76 @@
+---
+- name: Upgrade Microsoft Defender for Endpoint (MDE) on Ubuntu
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    mde_package: "mdatp"
+
+  tasks:
+
+    - name: Verify OS is Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+        fail_msg: "This playbook only supports Ubuntu. Detected: {{ ansible_distribution }}"
+        success_msg: "OS check passed: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Check if MDE is installed
+      ansible.builtin.command: dpkg -s mdatp
+      register: mde_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Upgrade MDE package to latest available version
+      ansible.builtin.apt:
+        name: "{{ mde_package }}"
+        state: latest
+      register: mde_upgrade_result
+      when: mde_installed.rc == 0
+
+    - name: Install MDE if not present
+      ansible.builtin.apt:
+        name: "{{ mde_package }}"
+        state: present
+      when: mde_installed.rc != 0
+
+    - name: Get new MDE platform version after upgrade
+      ansible.builtin.command: mdatp version
+      register: mde_new_version_output
+      changed_when: false
+
+    - name: Display new MDE version
+      ansible.builtin.debug:
+        msg: >
+          MDE on {{ inventory_hostname }}:
+          Before={{ mde_version_output.stdout | default('N/A') }} |
+          After={{ mde_new_version_output.stdout }}
+
+    - name: Confirm MDE service is running
+      ansible.builtin.systemd:
+        name: mdatp
+        state: started
+        enabled: true
+
+    - name: Check MDE health status
+      ansible.builtin.command: mdatp health --field healthy
+      register: mde_health
+      changed_when: false
+      failed_when: false
+
+    - name: Report MDE health
+      ansible.builtin.debug:
+        msg: "MDE health on {{ inventory_hostname }}: {{ mde_health.stdout }}"
+
+    - name: Warn if MDE reports unhealthy
+      ansible.builtin.debug:
+        msg: >
+          WARNING: MDE on {{ inventory_hostname }} is reporting unhealthy.
+          Run 'mdatp health' manually to investigate.
+      when: mde_health.stdout is defined and mde_health.stdout != "true"
