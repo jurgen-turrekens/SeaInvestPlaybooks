@@ -1,13 +1,16 @@
 ---
-- name: Check USN-8414-1 OpenSSL patch status
+- name: Check USN-8414-1 / DSA-6335-1 OpenSSL patch status
   hosts: all
   gather_facts: true
   vars:
-    required_versions:
+    ubuntu_required_versions:
       "22.04": "3.0.2-0ubuntu1.25"
       "24.04": "3.0.13-0ubuntu3.11"
       "25.10": "3.5.3-1ubuntu3.4"
       "26.04": "3.5.5-1ubuntu3.2"
+    debian_required_versions:
+      "11": "1.1.1w-0+deb11u7"
+      "12": "3.0.20-1~deb12u2"
 
   tasks:
     - name: Get installed openssl version
@@ -16,9 +19,17 @@
       changed_when: false
       failed_when: false
 
-    - name: Set required version for this release
+    - name: Set required version — Ubuntu
       ansible.builtin.set_fact:
-        required_ver: "{{ required_versions[ansible_distribution_version] | default('unknown') }}"
+        required_ver: "{{ ubuntu_required_versions[ansible_distribution_version] | default('unknown') }}"
+        advisory: "USN-8414-1"
+      when: ansible_distribution == "Ubuntu"
+
+    - name: Set required version — Debian
+      ansible.builtin.set_fact:
+        required_ver: "{{ debian_required_versions[ansible_distribution_major_version] | default('unknown') }}"
+        advisory: "DSA-6335-1"
+      when: ansible_distribution == "Debian"
 
     - name: Evaluate patch status
       ansible.builtin.set_fact:
@@ -27,20 +38,26 @@
             'PATCHED' if (openssl_version.stdout is version(required_ver, '>='))
             else 'UNPATCHED'
           }}
-      when: required_ver != 'unknown'
+      when:
+        - ansible_distribution in ['Ubuntu', 'Debian']
+        - required_ver != 'unknown'
 
     - name: Report result
       ansible.builtin.debug:
         msg: >-
           [{{ patch_status }}] {{ inventory_hostname }}
-          (Ubuntu {{ ansible_distribution_version }})
+          ({{ ansible_distribution }} {{ ansible_distribution_version }}) {{ advisory }}
           — installed: {{ openssl_version.stdout }}
           — required: >= {{ required_ver }}
-      when: required_ver != 'unknown'
+      when:
+        - ansible_distribution in ['Ubuntu', 'Debian']
+        - required_ver != 'unknown'
 
     - name: Warn on unsupported release
       ansible.builtin.debug:
         msg: >-
           [SKIPPED] {{ inventory_hostname }}
-          — Ubuntu {{ ansible_distribution_version }} not covered by USN-8414-1
-      when: required_ver == 'unknown'
+          — {{ ansible_distribution }} {{ ansible_distribution_version }} not covered
+      when: >-
+        ansible_distribution not in ['Ubuntu', 'Debian']
+        or required_ver | default('unknown') == 'unknown'
