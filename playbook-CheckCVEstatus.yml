@@ -1,0 +1,46 @@
+---
+- name: Check USN-8414-1 OpenSSL patch status
+  hosts: all
+  gather_facts: true
+  vars:
+    required_versions:
+      "22.04": "3.0.2-0ubuntu1.25"
+      "24.04": "3.0.13-0ubuntu3.11"
+      "25.10": "3.5.3-1ubuntu3.4"
+      "26.04": "3.5.5-1ubuntu3.2"
+
+  tasks:
+    - name: Get installed openssl version
+      ansible.builtin.command: dpkg-query -W -f='${Version}' openssl
+      register: openssl_version
+      changed_when: false
+      failed_when: false
+
+    - name: Set required version for this release
+      ansible.builtin.set_fact:
+        required_ver: "{{ required_versions[ansible_distribution_version] | default('unknown') }}"
+
+    - name: Evaluate patch status
+      ansible.builtin.set_fact:
+        patch_status: >-
+          {{
+            'PATCHED' if (openssl_version.stdout is version(required_ver, '>='))
+            else 'UNPATCHED'
+          }}
+      when: required_ver != 'unknown'
+
+    - name: Report result
+      ansible.builtin.debug:
+        msg: >-
+          [{{ patch_status }}] {{ inventory_hostname }}
+          (Ubuntu {{ ansible_distribution_version }})
+          — installed: {{ openssl_version.stdout }}
+          — required: >= {{ required_ver }}
+      when: required_ver != 'unknown'
+
+    - name: Warn on unsupported release
+      ansible.builtin.debug:
+        msg: >-
+          [SKIPPED] {{ inventory_hostname }}
+          — Ubuntu {{ ansible_distribution_version }} not covered by USN-8414-1
+      when: required_ver == 'unknown'
