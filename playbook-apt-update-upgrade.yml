@@ -1,0 +1,10 @@
+---
+- name: apt update and upgrade
+  hosts: all
+  become: true
+
+  tasks:
+    - name: update and upgrade packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: safe
