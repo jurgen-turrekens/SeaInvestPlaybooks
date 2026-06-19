@@ -1,0 +1,17 @@
+---
+- name: apt security upgrades only
+  hosts: all
+  become: true
+  tasks:
+    - name: Ensure unattended-upgrades is installed
+      ansible.builtin.apt:
+        name: unattended-upgrades
+        state: present
+        update_cache: true
+
+    - name: Apply security upgrades only
+      ansible.builtin.command:
+        cmd: unattended-upgrade --verbose
+      register: uu_result
+      changed_when: "'Packages that will be upgraded:' in uu_result.stdout"
+      failed_when: uu_result.rc != 0
