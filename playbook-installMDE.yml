@@ -13,12 +13,12 @@
     # Add Microsoft repository
     # Required to install mdatp from official MS repo
     # -----------------------------
-    # - name: Add Microsoft repository GPG key
-    #  apt_key:
-    #    keyserver: keyserver.ubuntu.com
-    #    id: BC528686B50D79E339D3721CEB3E94ADBE1229CF
-    #    state: present
-    #  ignore_errors: yes
+    - name: Add Microsoft repository GPG key
+      apt_key:
+        keyserver: keyserver.ubuntu.com
+        id: BC528686B50D79E339D3721CEB3E94ADBE1229CF
+        state: present
+      ignore_errors: yes
 
     - name: Update package cache after adding GPG key
       apt:
