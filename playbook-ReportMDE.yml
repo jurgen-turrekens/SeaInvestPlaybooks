@@ -3,27 +3,49 @@
   hosts: all
   become: true
   gather_facts: false
- 
+
   tasks:
- 
+
+    - name: Check mdatp service status
+      ansible.builtin.systemd:
+        name: mdatp
+      register: mdatp_service
+      failed_when: false
+      changed_when: false
+
+    - name: Set mdatp running fact
+      ansible.builtin.set_fact:
+        mdatp_running: "{{ mdatp_service.status.ActiveState | default('unknown') == 'active' }}"
+
     - name: Get platform version
       ansible.builtin.command: mdatp health --field app_version
       register: platform_version
       changed_when: false
- 
+      when: mdatp_running
+
     - name: Get definitions version
       ansible.builtin.command: mdatp health --field definitions_version
       register: definitions_version
       changed_when: false
- 
+      when: mdatp_running
+
     - name: Get definitions status
       ansible.builtin.command: mdatp health --field definitions_status
       register: definitions_status
       changed_when: false
- 
+      when: mdatp_running
+
     - name: MDE Status
       ansible.builtin.debug:
-        msg:
-          - "Host        : {{ inventory_hostname }}"
-          - "Platform    : {{ platform_version.stdout }}"
-          - "Definitions : {{ definitions_version.stdout }} ({{ definitions_status.stdout }})"
+        msg: >-
+          {{
+            ["Host        : " + inventory_hostname,
+             "Service     : " + (mdatp_running | ternary('RUNNING', 'NOT RUNNING'))]
+            +
+            (mdatp_running
+             | ternary(
+                 ["Platform    : " + platform_version.stdout,
+                  "Definitions : " + definitions_version.stdout + " (" + definitions_status.stdout + ")"],
+                 ["Platform    : N/A", "Definitions : N/A"]
+               ))
+          }}
