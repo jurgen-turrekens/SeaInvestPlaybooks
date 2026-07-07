@@ -22,7 +22,7 @@
   hosts: all
   become: yes
   vars:
-    mdatp_install: false   # set to true (or -e mdatp_install=true) to also install/upgrade mdatp at the end
+    mdatp_install: true   # set to true (or -e mdatp_install=true) to also install/upgrade mdatp at the end
 
   tasks:
 
