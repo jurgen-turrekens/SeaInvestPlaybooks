@@ -1,145 +1,189 @@
-- name: Cleanup Microsoft Repository Conflicts
+---
+# Cleans up any existing Microsoft package repo config, then re-adds the
+# CORRECT per-distro/per-version packages.microsoft.com repo + GPG key for
+# Microsoft Defender for Endpoint (mdatp).
+#
+# Supported by this playbook (matches MS's current support matrix):
+#   Ubuntu: 16.04, 18.04, 20.04, 22.04, 24.04
+#   Debian: 9, 10, 11, 12, 13
+#
+# GPG key handling (per Microsoft's manual deployment docs, June 2026):
+#   Debian 11 / Ubuntu 22.04 and EARLIER -> /etc/apt/trusted.gpg.d/microsoft.gpg
+#   Debian 12 / Ubuntu 24.04 and LATER   -> /usr/share/keyrings/microsoft-prod.gpg
+#   Debian 13 and later                  -> same path as above, but a DIFFERENT
+#                                            key file: microsoft-2025.asc
+#
+# The prod.list file fetched from packages.microsoft.com already contains the
+# correct signed-by= path baked in for that distro/version, so we don't need
+# to hand-craft the deb line ourselves - we just need to make sure the GPG
+# key ends up in the path that list expects.
+
+- name: Configure correct Microsoft package repo + GPG key for MDE (Debian/Ubuntu)
   hosts: all
   become: yes
+  vars:
+    mdatp_install: false   # set to true (or -e mdatp_install=true) to also install/upgrade mdatp at the end
 
   tasks:
-    # Debian/Ubuntu cleanup
-    - name: Remove Microsoft repository entries from main sources.list
-      lineinfile:
+
+    - name: Fail fast on anything that isn't Debian/Ubuntu
+      ansible.builtin.fail:
+        msg: "This playbook only supports Debian/Ubuntu hosts. Found: {{ ansible_distribution }}"
+      when: ansible_os_family != "Debian"
+
+    # ------------------------------------------------------------------
+    # 1. CLEANUP - remove any previous Microsoft repo entries/keys so we
+    #    start from a known-clean state before re-adding the right ones.
+    # ------------------------------------------------------------------
+
+    - name: Remove Microsoft entries from main sources.list
+      ansible.builtin.lineinfile:
         path: /etc/apt/sources.list
         regexp: '.*packages\.microsoft\.com.*'
         state: absent
-      when: ansible_os_family == "Debian"
 
-    - name: Find all apt source list files
-      find:
+    - name: Find existing apt source list files
+      ansible.builtin.find:
         paths: /etc/apt/sources.list.d/
         patterns: "*.list"
       register: source_files
-      when: ansible_os_family == "Debian"
 
-    - name: Remove Microsoft repository entries from all Debian source files
-      lineinfile:
+    - name: Remove Microsoft entries from other source list files
+      ansible.builtin.lineinfile:
         path: "{{ item.path }}"
         regexp: '.*packages\.microsoft\.com.*'
         state: absent
       loop: "{{ source_files.files }}"
-      when: ansible_os_family == "Debian" and source_files.files | length > 0
+      loop_control:
+        label: "{{ item.path }}"
+      when: source_files.files | length > 0
 
-    - name: Find Microsoft-specific list files
-      find:
-        paths: /etc/apt/sources.list.d/
-        patterns: "microsoft*.list"
-      register: microsoft_files
-      when: ansible_os_family == "Debian"
-
-    - name: Remove Microsoft-specific list files
-      file:
-        path: "{{ item.path }}"
+    - name: Remove Microsoft-specific list files (we'll re-add a clean one)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/microsoft-prod.list
         state: absent
-      loop: "{{ microsoft_files.files }}"
-      when: ansible_os_family == "Debian" and microsoft_files.files | length > 0
 
-    # RHEL/CentOS/Fedora cleanup
-    - name: Remove Microsoft repository entries from yum/dnf
-      shell: |
-        for repo in /etc/yum.repos.d/microsoft*.repo; do
-          if [ -f "$repo" ]; then
-            rm "$repo"
-          fi
-        done
-      changed_when: false
-      when: ansible_os_family == "RedHat"
-
-    # SUSE cleanup
-    - name: Remove Microsoft repository entries from zypper
-      shell: |
-        for repo in /etc/zypp/repos.d/microsoft*.repo; do
-          if [ -f "$repo" ]; then
-            rm "$repo"
-          fi
-        done
-      changed_when: false
-      when: ansible_os_family == "Suse"
-
-    # GPG keys cleanup (common to Debian)
-    - name: Remove Microsoft GPG keys from /usr/share/keyrings/
-      find:
-        paths: /usr/share/keyrings/
-        patterns: "microsoft*.gpg"
-      register: gpg_keys_usr
-      when: ansible_os_family == "Debian"
-
-    - name: Delete GPG keys from /usr/share/keyrings/
-      file:
-        path: "{{ item.path }}"
+    - name: Remove old Microsoft GPG keys (all known locations)
+      ansible.builtin.file:
+        path: "{{ item }}"
         state: absent
-      loop: "{{ gpg_keys_usr.files }}"
-      when: ansible_os_family == "Debian" and gpg_keys_usr.files | length > 0
+      loop:
+        - /usr/share/keyrings/microsoft-prod.gpg
+        - /etc/apt/keyrings/microsoft-prod.gpg
+        - /etc/apt/trusted.gpg.d/microsoft.gpg
 
-    - name: Remove Microsoft GPG keys from /etc/apt/keyrings/
-      find:
-        paths: /etc/apt/keyrings/
-        patterns: "microsoft*.gpg"
-      register: gpg_keys_etc
-      when: ansible_os_family == "Debian"
-
-    - name: Delete GPG keys from /etc/apt/keyrings/
-      file:
-        path: "{{ item.path }}"
-        state: absent
-      loop: "{{ gpg_keys_etc.files }}"
-      when: ansible_os_family == "Debian" and gpg_keys_etc.files | length > 0
-
-    - name: Remove Microsoft GPG keys from /etc/apt/trusted.gpg.d/
-      find:
-        paths: /etc/apt/trusted.gpg.d/
-        patterns: "microsoft*.gpg"
-      register: gpg_keys_trusted
-      when: ansible_os_family == "Debian"
-
-    - name: Delete GPG keys from /etc/apt/trusted.gpg.d/
-      file:
-        path: "{{ item.path }}"
-        state: absent
-      loop: "{{ gpg_keys_trusted.files }}"
-      when: ansible_os_family == "Debian" and gpg_keys_trusted.files | length > 0
-
-    # Package cache cleanup
     - name: Clean apt cache
-      command: apt clean
+      ansible.builtin.command: apt-get clean
       changed_when: false
-      when: ansible_os_family == "Debian"
 
-    - name: Clean yum/dnf cache
-      command: "{{ 'dnf clean all' if ansible_distribution_major_version | int >= 22 else 'yum clean all' }}"
-      changed_when: false
-      when: ansible_os_family == "RedHat"
+    # ------------------------------------------------------------------
+    # 2. DETECT the right key path / key source URL for this host
+    # ------------------------------------------------------------------
 
-    - name: Clean zypper cache
-      command: zypper clean
-      changed_when: false
-      when: ansible_os_family == "Suse"
+    - name: Set repo distro name as Microsoft expects it (ubuntu/debian)
+      ansible.builtin.set_fact:
+        ms_distro: "{{ ansible_distribution | lower }}"
 
-    # Update package cache
-    - name: Update apt cache
-      apt:
+    - name: Determine if this host uses the "new" (post Debian12/Ubuntu24.04) keyring layout
+      ansible.builtin.set_fact:
+        ms_uses_new_keyring: >-
+          {{
+            (ansible_distribution == "Debian" and (ansible_distribution_major_version | int) >= 12)
+            or
+            (ansible_distribution == "Ubuntu" and (ansible_distribution_version is version('24.04', '>=')))
+          }}
+
+    - name: Determine if this host needs the newer 2025 signing key (Debian 13+)
+      ansible.builtin.set_fact:
+        ms_uses_2025_key: >-
+          {{
+            ansible_distribution == "Debian" and (ansible_distribution_major_version | int) >= 13
+          }}
+
+    - name: Set final GPG key path
+      ansible.builtin.set_fact:
+        ms_gpg_path: "{{ '/usr/share/keyrings/microsoft-prod.gpg' if ms_uses_new_keyring else '/etc/apt/trusted.gpg.d/microsoft.gpg' }}"
+
+    - name: Set final GPG key source URL
+      ansible.builtin.set_fact:
+        ms_gpg_key_url: "{{ 'https://packages.microsoft.com/keys/microsoft-2025.asc' if ms_uses_2025_key else 'https://packages.microsoft.com/keys/microsoft.asc' }}"
+
+    - name: Set repo config (prod.list) URL for this distro/version
+      ansible.builtin.set_fact:
+        ms_repo_list_url: "https://packages.microsoft.com/config/{{ ms_distro }}/{{ ansible_distribution_version }}/prod.list"
+
+    - name: Show resolved config for this host
+      ansible.builtin.debug:
+        msg:
+          - "Distro: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "GPG key path: {{ ms_gpg_path }}"
+          - "GPG key source: {{ ms_gpg_key_url }}"
+          - "Repo list URL: {{ ms_repo_list_url }}"
+
+    # ------------------------------------------------------------------
+    # 3. INSTALL prerequisites, GPG key, repo file
+    # ------------------------------------------------------------------
+
+    - name: Ensure prerequisite packages are present
+      ansible.builtin.apt:
+        name:
+          - curl
+          - gnupg
+          - apt-transport-https
+        state: present
         update_cache: yes
-      ignore_errors: yes
-      when: ansible_os_family == "Debian"
 
-    - name: Update yum/dnf cache
-      command: "{{ 'dnf makecache' if ansible_distribution_major_version | int >= 22 else 'yum makecache' }}"
-      changed_when: false
-      ignore_errors: yes
-      when: ansible_os_family == "RedHat"
+    - name: Ensure /usr/share/keyrings exists (new layout only)
+      ansible.builtin.file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: "0755"
+      when: ms_uses_new_keyring
 
-    - name: Update zypper cache
-      command: zypper refresh
-      changed_when: false
-      ignore_errors: yes
-      when: ansible_os_family == "Suse"
+    - name: Download Microsoft GPG key (ASCII)
+      ansible.builtin.get_url:
+        url: "{{ ms_gpg_key_url }}"
+        dest: /tmp/microsoft.asc
+        mode: "0644"
+        force: yes
 
-    - name: Display cleanup completion message
-      debug:
-        msg: "Microsoft repository cleanup complete for {{ ansible_os_family }}. Ready for fresh installation."
+    - name: Dearmor and install Microsoft GPG key into the correct path
+      ansible.builtin.shell: >
+        gpg --dearmor < /tmp/microsoft.asc > {{ ms_gpg_path }}
+      args:
+        creates: "{{ ms_gpg_path }}"
+
+    - name: Fix permissions on installed GPG key
+      ansible.builtin.file:
+        path: "{{ ms_gpg_path }}"
+        mode: "0644"
+
+    - name: Clean up downloaded key file
+      ansible.builtin.file:
+        path: /tmp/microsoft.asc
+        state: absent
+
+    - name: Fetch and install the correct prod.list for this distro/version
+      ansible.builtin.get_url:
+        url: "{{ ms_repo_list_url }}"
+        dest: /etc/apt/sources.list.d/microsoft-prod.list
+        mode: "0644"
+        force: yes
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    # ------------------------------------------------------------------
+    # 4. OPTIONAL - install/upgrade mdatp
+    # ------------------------------------------------------------------
+
+    - name: Install/upgrade mdatp
+      ansible.builtin.apt:
+        name: mdatp
+        state: latest
+      when: mdatp_install | bool
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "Microsoft repo + GPG key configured for {{ ansible_distribution }} {{ ansible_distribution_version }} ({{ ms_gpg_path }})."
