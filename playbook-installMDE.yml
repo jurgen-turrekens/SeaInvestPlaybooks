@@ -78,6 +78,29 @@
         remote_src: yes
       when: copy_result.changed
 
+    # --------------------------
+    # Install mdatp from official Microsoft repository
+    # --------------------------
+    - name: Add Microsoft GPG key
+      apt_key:
+        url: https://packages.microsoft.com/keys/microsoft.asc
+        state: present
+
+    - name: Add Microsoft Defender for Endpoint repository
+      apt_repository:
+        repo: "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-archive-keyring.gpg] https://packages.microsoft.com/ubuntu {{ ansible_distribution_release }} main"
+        state: present
+        filename: microsoft-mde
+
+    - name: Update apt cache after adding Microsoft repo
+      apt:
+        update_cache: yes
+
+    - name: Install mdatp package
+      apt:
+        name: mdatp
+        state: present
+
     - name: Run MDE onboarding script
       command: >
         python3 {{ mde_extract_path }}/MicrosoftDefenderATPOnboardingLinuxServer.py
