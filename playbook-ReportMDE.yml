@@ -21,31 +21,38 @@
       ansible.builtin.command: mdatp health --field app_version
       register: platform_version
       changed_when: false
+      failed_when: false
       when: mdatp_running
 
     - name: Get definitions version
       ansible.builtin.command: mdatp health --field definitions_version
       register: definitions_version
       changed_when: false
+      failed_when: false
       when: mdatp_running
 
     - name: Get definitions status
       ansible.builtin.command: mdatp health --field definitions_status
       register: definitions_status
       changed_when: false
+      failed_when: false
       when: mdatp_running
+
+    # Resolve safe display values BEFORE any ternary/formatting.
+    # This avoids the classic Ansible/Jinja gotcha where ternary() eagerly
+    # evaluates BOTH branches (it's a filter, so all args are built first),
+    # which used to blow up on skipped registered vars (no .stdout key)
+    # even though that branch was never meant to be used.
+    - name: Set display facts
+      ansible.builtin.set_fact:
+        platform_display: "{{ platform_version.stdout | default('N/A') }}"
+        definitions_display: "{{ definitions_version.stdout | default('N/A') }}"
+        definitions_status_display: "{{ definitions_status.stdout | default('N/A') }}"
 
     - name: MDE Status
       ansible.builtin.debug:
-        msg: >-
-          {{
-            ["Host        : " + inventory_hostname,
-             "Service     : " + (mdatp_running | ternary('RUNNING', 'NOT RUNNING'))]
-            +
-            (mdatp_running
-             | ternary(
-                 ["Platform    : " + platform_version.stdout,
-                  "Definitions : " + definitions_version.stdout + " (" + definitions_status.stdout + ")"],
-                 ["Platform    : N/A", "Definitions : N/A"]
-               ))
-          }}
+        msg:
+          - "Host        : {{ inventory_hostname }}"
+          - "Service     : {{ mdatp_running | ternary('RUNNING', 'NOT RUNNING') }}"
+          - "Platform    : {{ platform_display }}"
+          - "Definitions : {{ definitions_display }} ({{ definitions_status_display }})"
