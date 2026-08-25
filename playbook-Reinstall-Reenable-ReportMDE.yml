@@ -1,0 +1,110 @@
+---
+- name: MDE Remediation and Status Report
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Upgrade mdatp to latest available build
+      ansible.builtin.apt:
+        name: mdatp
+        state: latest
+        update_cache: true
+      register: mdatp_upgrade
+
+    - name: Ensure mdatp service is enabled and started
+      ansible.builtin.systemd:
+        name: mdatp
+        enabled: true
+        state: started
+
+    # The agent needs a few seconds after (re)start to complete its
+    # cloud/license check - querying mdatp too early can transiently
+    # report "Cannot determine license status" even on a healthy host.
+    - name: Give the agent a moment to complete its license/cloud check
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Check mdatp service status
+      ansible.builtin.systemd:
+        name: mdatp
+      register: mdatp_service
+      failed_when: false
+      changed_when: false
+
+    - name: Set mdatp running fact
+      ansible.builtin.set_fact:
+        mdatp_running: "{{ mdatp_service.status.ActiveState | default('unknown') == 'active' }}"
+
+    - name: Get platform version
+      ansible.builtin.command: mdatp health --field app_version
+      register: platform_version
+      changed_when: false
+      failed_when: false
+      when: mdatp_running
+
+    - name: Get definitions version
+      ansible.builtin.command: mdatp health --field definitions_version
+      register: definitions_version
+      changed_when: false
+      failed_when: false
+      when: mdatp_running
+
+    - name: Get definitions status
+      ansible.builtin.command: mdatp health --field definitions_status
+      register: definitions_status
+      changed_when: false
+      failed_when: false
+      when: mdatp_running
+
+    - name: Get licensed field
+      ansible.builtin.command: mdatp health --field licensed
+      register: licensed_field
+      changed_when: false
+      failed_when: false
+      when: mdatp_running
+
+    # Resolve every value through default() up front so the summary
+    # play can just print hostvars, without touching .stdout on a
+    # possibly-skipped registered var directly.
+    - name: Set display facts
+      ansible.builtin.set_fact:
+        platform_display: "{{ platform_version.stdout | default('N/A') }}"
+        definitions_display: "{{ definitions_version.stdout | default('N/A') }}"
+        definitions_status_display: "{{ definitions_status.stdout | default('N/A') }}"
+        licensed_display: "{{ licensed_field.stdout | default('N/A') }}"
+
+
+- name: MDE Status Summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+    - name: Build summary table text
+      ansible.builtin.set_fact:
+        mde_table_text: |-
+          {{ '%-22s %-13s %-16s %-25s %-8s' | format('HOST', 'SERVICE', 'PLATFORM', 'DEFINITIONS', 'LICENSED') }}
+          {%- for h in groups['all'] | sort %}
+          {{ '%-22s %-13s %-16s %-25s %-8s' | format(
+                h,
+                (hostvars[h].mdatp_running | default(false)) | ternary('RUNNING', 'NOT RUNNING'),
+                hostvars[h].platform_display | default('N/A'),
+                (hostvars[h].definitions_display | default('N/A')) ~ ' (' ~ (hostvars[h].definitions_status_display | default('N/A')) ~ ')',
+                hostvars[h].licensed_display | default('N/A')
+             ) }}
+          {%- endfor %}
+
+    - name: Print MDE status summary
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            [
+              (groups['all'] | map('extract', hostvars, 'mdatp_running') | select | list | length | string)
+              ~ ' / ' ~ (groups['all'] | length | string) ~ ' hosts RUNNING',
+              ''
+            ]
+            + (mde_table_text.split('\n') | map('trim') | reject('equalto', '') | list)
+          }}
