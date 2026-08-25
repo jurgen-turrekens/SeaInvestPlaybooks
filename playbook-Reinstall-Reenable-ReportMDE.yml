@@ -68,12 +68,31 @@
     # Resolve every value through default() up front, and strip the
     # surrounding quotes `mdatp health --field` puts around string
     # values, so the summary play can print hostvars as-is.
+    #
+    # A host whose license has failed prints its "ATTENTION: No
+    # license found..." warning to stdout ahead of the actual value,
+    # on every field query - so its raw stdout is multi-line garbage
+    # rather than a clean value. Detect that case up front and flag
+    # the host instead of feeding the garbled text into the report.
+    - name: Detect license/health errors in raw output
+      ansible.builtin.set_fact:
+        mdatp_health_error: >-
+          {{
+            mdatp_running and
+            (
+              (platform_version.stdout | default(''))
+              ~ (definitions_version.stdout | default(''))
+              ~ (definitions_status.stdout | default(''))
+              ~ (licensed_field.stdout | default(''))
+            ) is search('ATTENTION')
+          }}
+
     - name: Set display facts
       ansible.builtin.set_fact:
-        platform_display: "{{ platform_version.stdout | default('N/A') | regex_replace('\"', '') }}"
-        definitions_display: "{{ definitions_version.stdout | default('N/A') | regex_replace('\"', '') }}"
-        definitions_status_display: "{{ definitions_status.stdout | default('N/A') | regex_replace('\"', '') }}"
-        licensed_display: "{{ licensed_field.stdout | default('N/A') | regex_replace('\"', '') }}"
+        platform_display: "{{ 'N/A' if mdatp_health_error else (platform_version.stdout | default('N/A') | regex_replace('\"', '')) }}"
+        definitions_display: "{{ 'N/A' if mdatp_health_error else (definitions_version.stdout | default('N/A') | regex_replace('\"', '')) }}"
+        definitions_status_display: "{{ 'N/A' if mdatp_health_error else (definitions_status.stdout | default('N/A') | regex_replace('\"', '')) }}"
+        licensed_display: "{{ 'N/A' if mdatp_health_error else (licensed_field.stdout | default('N/A') | regex_replace('\"', '')) }}"
 
 
 - name: MDE Status Summary
@@ -87,6 +106,11 @@
     # a wide table wraps unpredictably in narrow consoles (AWX job
     # output, mobile, etc.); short blocks stay readable regardless of
     # width. Problem hosts are listed first so they're not buried.
+    #
+    # Every hostvars lookup goes through default() - a host that
+    # failed before mdatp_running was even set (e.g. the upgrade task
+    # itself failed) still needs to show up as a problem host rather
+    # than crashing the whole report.
     - name: Build summary blocks
       ansible.builtin.set_fact:
         not_running_block: |-
@@ -95,9 +119,15 @@
           - {{ h }}
           {% endif -%}
           {% endfor %}
+        license_error_block: |-
+          {% for h in groups['all'] | sort %}
+          {%- if hostvars[h].mdatp_health_error | default(false) %}
+          - {{ h }} (service running, license/health check failed)
+          {% endif -%}
+          {% endfor %}
         running_block: |-
           {% for h in groups['all'] | sort %}
-          {%- if hostvars[h].mdatp_running | default(false) %}
+          {%- if (hostvars[h].mdatp_running | default(false)) and not (hostvars[h].mdatp_health_error | default(false)) %}
           {{ h }}
               Platform    : {{ hostvars[h].platform_display | default('N/A') }}
               Definitions : {{ hostvars[h].definitions_display | default('N/A') }} ({{ hostvars[h].definitions_status_display | default('N/A') }})
@@ -112,17 +142,22 @@
           {{
             (
               [
-                (groups['all'] | map('extract', hostvars, 'mdatp_running') | select | list | length | string)
-                ~ ' / ' ~ (groups['all'] | length | string) ~ ' hosts RUNNING',
+                (running_block.splitlines() | select('match', '^[^ ]') | reject('equalto', '') | list | length | string)
+                ~ ' / ' ~ (groups['all'] | length | string) ~ ' hosts healthy and RUNNING',
                 ''
               ]
               +
               (
-                ['NOT RUNNING:'] + (not_running_block.splitlines() | map('trim') | reject('equalto', '') | list)
+                ['NOT RUNNING:'] + (not_running_block.splitlines() | map('trim') | reject('equalto', '') | list) + ['']
                 if (not_running_block | trim | length > 0)
                 else []
               )
-              + ['']
+              +
+              (
+                ['LICENSE / HEALTH ERROR:'] + (license_error_block.splitlines() | map('trim') | reject('equalto', '') | list) + ['']
+                if (license_error_block | trim | length > 0)
+                else []
+              )
               + ['RUNNING:']
               + (running_block.splitlines() | reject('equalto', '') | list)
             )
