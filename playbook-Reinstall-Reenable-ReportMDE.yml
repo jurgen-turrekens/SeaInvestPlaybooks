@@ -65,15 +65,15 @@
       failed_when: false
       when: mdatp_running
 
-    # Resolve every value through default() up front so the summary
-    # play can just print hostvars, without touching .stdout on a
-    # possibly-skipped registered var directly.
+    # Resolve every value through default() up front, and strip the
+    # surrounding quotes `mdatp health --field` puts around string
+    # values, so the summary play can print hostvars as-is.
     - name: Set display facts
       ansible.builtin.set_fact:
-        platform_display: "{{ platform_version.stdout | default('N/A') }}"
-        definitions_display: "{{ definitions_version.stdout | default('N/A') }}"
-        definitions_status_display: "{{ definitions_status.stdout | default('N/A') }}"
-        licensed_display: "{{ licensed_field.stdout | default('N/A') }}"
+        platform_display: "{{ platform_version.stdout | default('N/A') | regex_replace('\"', '') }}"
+        definitions_display: "{{ definitions_version.stdout | default('N/A') | regex_replace('\"', '') }}"
+        definitions_status_display: "{{ definitions_status.stdout | default('N/A') | regex_replace('\"', '') }}"
+        licensed_display: "{{ licensed_field.stdout | default('N/A') | regex_replace('\"', '') }}"
 
 
 - name: MDE Status Summary
@@ -83,28 +83,47 @@
 
   tasks:
 
-    - name: Build summary table text
+    # One short block per host instead of a wide fixed-column table -
+    # a wide table wraps unpredictably in narrow consoles (AWX job
+    # output, mobile, etc.); short blocks stay readable regardless of
+    # width. Problem hosts are listed first so they're not buried.
+    - name: Build summary blocks
       ansible.builtin.set_fact:
-        mde_table_text: |-
-          {{ '%-22s %-13s %-16s %-25s %-8s' | format('HOST', 'SERVICE', 'PLATFORM', 'DEFINITIONS', 'LICENSED') }}
-          {%- for h in groups['all'] | sort %}
-          {{ '%-22s %-13s %-16s %-25s %-8s' | format(
-                h,
-                (hostvars[h].mdatp_running | default(false)) | ternary('RUNNING', 'NOT RUNNING'),
-                hostvars[h].platform_display | default('N/A'),
-                (hostvars[h].definitions_display | default('N/A')) ~ ' (' ~ (hostvars[h].definitions_status_display | default('N/A')) ~ ')',
-                hostvars[h].licensed_display | default('N/A')
-             ) }}
-          {%- endfor %}
+        not_running_block: |-
+          {% for h in groups['all'] | sort %}
+          {%- if not (hostvars[h].mdatp_running | default(false)) %}
+          - {{ h }}
+          {% endif -%}
+          {% endfor %}
+        running_block: |-
+          {% for h in groups['all'] | sort %}
+          {%- if hostvars[h].mdatp_running | default(false) %}
+          {{ h }}
+              Platform    : {{ hostvars[h].platform_display | default('N/A') }}
+              Definitions : {{ hostvars[h].definitions_display | default('N/A') }} ({{ hostvars[h].definitions_status_display | default('N/A') }})
+              Licensed    : {{ hostvars[h].licensed_display | default('N/A') }}
+
+          {% endif -%}
+          {% endfor %}
 
     - name: Print MDE status summary
       ansible.builtin.debug:
         msg: >-
           {{
-            [
-              (groups['all'] | map('extract', hostvars, 'mdatp_running') | select | list | length | string)
-              ~ ' / ' ~ (groups['all'] | length | string) ~ ' hosts RUNNING',
-              ''
-            ]
-            + (mde_table_text.split('\n') | map('trim') | reject('equalto', '') | list)
+            (
+              [
+                (groups['all'] | map('extract', hostvars, 'mdatp_running') | select | list | length | string)
+                ~ ' / ' ~ (groups['all'] | length | string) ~ ' hosts RUNNING',
+                ''
+              ]
+              +
+              (
+                ['NOT RUNNING:'] + (not_running_block.splitlines() | map('trim') | reject('equalto', '') | list)
+                if (not_running_block | trim | length > 0)
+                else []
+              )
+              + ['']
+              + ['RUNNING:']
+              + (running_block.splitlines() | reject('equalto', '') | list)
+            )
           }}
