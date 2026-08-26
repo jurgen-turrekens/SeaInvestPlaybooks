@@ -1,0 +1,24 @@
+---
+- name: Gather serial numbers
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: Fallback to dmidecode if ansible_product_serial is not set
+      command: dmidecode -s system-serial-number
+      register: dmidecode_serial
+      become: true
+      changed_when: false
+      when: ansible_product_serial is not defined or ansible_product_serial in ("", "NA", "None")
+
+    - name: Set final serial fact
+      set_fact:
+        machine_serial: "{{ dmidecode_serial.stdout | default(ansible_product_serial) | default('UNKNOWN') }}"
+
+- name: Report serial numbers
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Build summary
+      debug:
+        msg: "{{ item }} -> {{ hostvars[item].machine_serial | default('UNKNOWN') }}"
+      loop: "{{ groups['all'] }}"
