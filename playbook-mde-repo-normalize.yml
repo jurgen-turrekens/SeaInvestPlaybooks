@@ -38,6 +38,15 @@
 
   tasks:
 
+    # Remember which hosts this run targets (after any Limit), so the
+    # summary doesn't report the rest of the inventory as failed.
+    - name: Record the hosts targeted by this run
+      ansible.builtin.set_fact:
+        norm_targets: "{{ ansible_play_hosts_all }}"
+      delegate_to: localhost
+      delegate_facts: true
+      run_once: true
+
     - name: Download Microsoft signing key on the controller
       ansible.builtin.get_url:
         url: "{{ ms_key_url }}"
@@ -297,7 +306,7 @@
   gather_facts: false
 
   vars:
-    norm_hosts: "{{ groups['all'] | difference(['localhost']) | sort }}"
+    norm_hosts: "{{ hostvars['localhost'].norm_targets | default(groups['all']) | difference(['localhost']) | sort }}"
 
   tasks:
 
