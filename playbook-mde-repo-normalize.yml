@@ -1,0 +1,339 @@
+---
+# MDE: normalize the Microsoft package repo, then upgrade mdatp
+#
+# Per host:
+#   1. Works out the one correct packages.microsoft.com "prod" repo from
+#      distro facts: ubuntu/<version>/prod or debian/<major>/prod.
+#   2. Skips the host if Microsoft doesn't publish that repo (checked from
+#      the controller, so it works even if the host has no direct internet).
+#   3. Backs up /etc/apt/sources.list and sources.list.d to /var/backups.
+#   4. Removes every other ubuntu|debian/*/prod entry (duplicates, wrong
+#      distro, old releases) from .list and .sources files. Other Microsoft
+#      product repos (e.g. repos/azure-cli) are left alone and reported.
+#   5. Installs the Microsoft key as a dedicated keyring and writes one
+#      signed-by entry to /etc/apt/sources.list.d/microsoft-prod.list.
+#   6. apt-get update must succeed and mdatp must be offered by the new repo.
+#      If not, the sources backup is restored and the host is reported as
+#      rolled back with the reason.
+#   7. Upgrades mdatp (only where it is already installed).
+#
+# Safe to rerun: a host that is already normalized reports no changes.
+# Try it on one or two hosts first (AWX: Limit).
+
+- name: Normalize Microsoft repo and upgrade mdatp
+  hosts: all
+  become: true
+  gather_facts: true
+  gather_subset:
+    - min
+
+  vars:
+    ms_key_url: https://packages.microsoft.com/keys/microsoft.asc
+    ms_key_local: /tmp/microsoft-prod.asc
+    ms_keyring: /usr/share/keyrings/microsoft-prod.asc
+    ms_list_file: /etc/apt/sources.list.d/microsoft-prod.list
+    # Matches the per-distro "prod" repos only - not product repos such as
+    # packages.microsoft.com/repos/azure-cli.
+    ms_prod_regex: 'packages\.microsoft\.com/(ubuntu|debian)/[0-9.]+/prod'
+
+  tasks:
+
+    - name: Download Microsoft signing key on the controller
+      ansible.builtin.get_url:
+        url: "{{ ms_key_url }}"
+        dest: "{{ ms_key_local }}"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Work out the correct Microsoft repo for this host
+      ansible.builtin.set_fact:
+        ms_supported: "{{ ansible_distribution in ['Ubuntu', 'Debian'] }}"
+        ms_repo_path: >-
+          {{ ('ubuntu/' ~ ansible_distribution_version ~ '/prod')
+             if ansible_distribution == 'Ubuntu'
+             else ('debian/' ~ ansible_distribution_major_version ~ '/prod') }}
+        ms_codename: "{{ ansible_distribution_release }}"
+        apt_backup: "/var/backups/apt-sources-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+        norm_status: pending
+        norm_note: ''
+        norm_cleaned: 0
+
+    - name: Mark unsupported distributions as skipped
+      ansible.builtin.set_fact:
+        norm_status: skipped
+        norm_note: "{{ ansible_distribution }} is not Debian/Ubuntu"
+      when: not ms_supported
+
+    - name: Stop here for unsupported distributions
+      ansible.builtin.meta: end_host
+      when: not ms_supported
+
+    - name: Get architecture
+      ansible.builtin.command: dpkg --print-architecture
+      register: deb_arch
+      changed_when: false
+
+    - name: Get installed mdatp version (before)
+      ansible.builtin.command: dpkg-query -W -f=${Version} mdatp
+      register: mdatp_before
+      changed_when: false
+      failed_when: false
+
+    - name: Record version before
+      ansible.builtin.set_fact:
+        norm_before: "{{ mdatp_before.stdout | default('') | trim }}"
+
+    - name: Check Microsoft publishes this repo
+      ansible.builtin.uri:
+        url: "https://packages.microsoft.com/{{ ms_repo_path }}/dists/{{ ms_codename }}/Release"
+        method: HEAD
+        status_code: [200, 404]
+      register: repo_check
+      delegate_to: localhost
+      become: false
+      failed_when: false
+
+    - name: Mark hosts whose repo does not exist (yet) as skipped
+      ansible.builtin.set_fact:
+        norm_status: skipped
+        norm_note: "packages.microsoft.com/{{ ms_repo_path }} ({{ ms_codename }}) is not published"
+      when: repo_check.status | default(0) == 404
+
+    - name: Stop here for hosts without a published repo
+      ansible.builtin.meta: end_host
+      when: repo_check.status | default(0) == 404
+
+    # Recorded as unchanged so the recap only shows real repo changes.
+    - name: Back up apt sources
+      ansible.builtin.shell: |
+        set -e
+        cd /
+        tar czf {{ apt_backup }} $(ls -d etc/apt/sources.list etc/apt/sources.list.d 2>/dev/null)
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Normalize repo and upgrade mdatp
+      block:
+
+        # Classify deb822 files first, before anything is changed: a file
+        # that mixes Microsoft prod entries with other repos is not edited
+        # automatically.
+        - name: Find .sources files with Microsoft prod repo entries
+          ansible.builtin.find:
+            paths: /etc/apt/sources.list.d
+            patterns: '*.sources'
+            contains: '^\s*URIs:.*{{ ms_prod_regex }}'
+          register: ms_sources_files
+
+        - name: Read those .sources files
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          loop: "{{ ms_sources_files.files | map(attribute='path') | list }}"
+          register: ms_sources_content
+
+        - name: Classify .sources files
+          ansible.builtin.set_fact:
+            sources_classified: >-
+              {%- set ns = namespace(d=[], r=[]) -%}
+              {%- for res in ms_sources_content.results | default([]) -%}
+              {%- set uris = ((res.content | b64decode).splitlines()
+                    | select('match', '^\s*URIs:')
+                    | map('regex_replace', '^\s*URIs:\s*', '')
+                    | join(' ')).split() -%}
+              {%- if uris | reject('search', ms_prod_regex) | list | length == 0 -%}
+              {%- set ns.d = ns.d + [res.item] -%}
+              {%- else -%}
+              {%- set ns.r = ns.r + [res.item] -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ {'delete': ns.d, 'review': ns.r} | to_json }}
+
+        - name: Stop on .sources files that mix Microsoft prod with other repos
+          ansible.builtin.fail:
+            msg: "Manual review needed, mixed .sources file(s): {{ (sources_classified | from_json).review | join(', ') }}"
+          when: (sources_classified | from_json).review | length > 0
+
+        - name: Find .list files with Microsoft prod repo entries
+          ansible.builtin.find:
+            paths: /etc/apt/sources.list.d
+            patterns: '*.list'
+            contains: '^\s*deb(-src)?\s.*{{ ms_prod_regex }}'
+            excludes: "{{ ms_list_file | basename }}"
+          register: ms_list_files
+
+        - name: Check for a main sources.list
+          ansible.builtin.stat:
+            path: /etc/apt/sources.list
+          register: main_list
+
+        - name: Remove stale and duplicate Microsoft prod entries from .list files
+          ansible.builtin.lineinfile:
+            path: "{{ item }}"
+            regexp: '^\s*deb(-src)?\s.*{{ ms_prod_regex }}'
+            state: absent
+          loop: >-
+            {{ (ms_list_files.files | map(attribute='path') | list)
+               + (['/etc/apt/sources.list'] if main_list.stat.exists else []) }}
+          register: removed_lines
+
+        - name: Delete .list files left with no active entries
+          ansible.builtin.shell: |
+            if ! grep -qE '^[[:space:]]*deb' "{{ item }}"; then rm -f "{{ item }}"; echo removed; fi
+          loop: "{{ ms_list_files.files | map(attribute='path') | list }}"
+          register: emptied
+          changed_when: "'removed' in emptied.stdout"
+
+        - name: Delete .sources files that only define Microsoft prod repos
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop: "{{ (sources_classified | from_json).delete }}"
+          register: sources_deleted
+
+        - name: Install Microsoft signing key as a dedicated keyring
+          ansible.builtin.copy:
+            src: "{{ ms_key_local }}"
+            dest: "{{ ms_keyring }}"
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Write the single Microsoft prod repo entry
+          ansible.builtin.copy:
+            dest: "{{ ms_list_file }}"
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              # Managed by Ansible (mde-repo-normalize.yml) - do not edit
+              deb [arch={{ deb_arch.stdout | trim }} signed-by={{ ms_keyring }}] https://packages.microsoft.com/{{ ms_repo_path }} {{ ms_codename }} main
+          register: list_written
+
+        - name: Refresh apt cache with the new repo
+          ansible.builtin.command: apt-get update
+          environment:
+            LC_ALL: C
+          register: apt_refresh
+          changed_when: false
+          failed_when: >-
+            apt_refresh.rc != 0 or
+            (apt_refresh.stdout ~ '\n' ~ apt_refresh.stderr)
+              is search('^(Err|E:).*packages\.microsoft\.com', multiline=True)
+
+        - name: Confirm the new repo offers mdatp
+          ansible.builtin.command: apt-cache madison mdatp
+          environment:
+            LC_ALL: C
+          register: mdatp_madison
+          changed_when: false
+          failed_when: ('packages.microsoft.com/' ~ ms_repo_path) not in mdatp_madison.stdout
+
+        - name: Upgrade mdatp to the latest build
+          ansible.builtin.apt:
+            name: mdatp
+            state: latest
+            only_upgrade: true
+
+        - name: Record success
+          ansible.builtin.set_fact:
+            norm_status: normalized
+            norm_cleaned: >-
+              {{ (removed_lines.results | default([]) | selectattr('changed') | list | length)
+                 + (sources_deleted.results | default([]) | selectattr('changed') | list | length) }}
+
+      rescue:
+
+        - name: Record the failure
+          ansible.builtin.set_fact:
+            norm_status: rolled_back
+            norm_note: >-
+              {{ ansible_failed_task.name }}:
+              {{ ((ansible_failed_result.stdout_lines | default([]))
+                  + (ansible_failed_result.stderr_lines | default([])))
+                 | select('match', '^(Err|E:)') | first
+                 | default(ansible_failed_result.msg | default('failed'), true)
+                 | truncate(200) }}
+
+        - name: Restore apt sources from backup
+          ansible.builtin.shell: |
+            set -e
+            find /etc/apt/sources.list.d -mindepth 1 -delete
+            tar xzf {{ apt_backup }} -C /
+          args:
+            executable: /bin/bash
+
+        - name: Refresh apt cache after restore
+          ansible.builtin.command: apt-get update
+          changed_when: false
+          failed_when: false
+
+    - name: Get installed mdatp version (after)
+      ansible.builtin.command: dpkg-query -W -f=${Version} mdatp
+      register: mdatp_after
+      changed_when: false
+      failed_when: false
+
+    - name: List other Microsoft repos left in place
+      ansible.builtin.shell: >-
+        grep -rhsE 'packages\.microsoft\.com' /etc/apt/sources.list /etc/apt/sources.list.d/
+        | grep -vE '^[[:space:]]*#'
+        | grep -vE '{{ ms_prod_regex }}'
+      register: other_ms_repos
+      changed_when: false
+      failed_when: false
+
+    - name: Record results for the summary
+      ansible.builtin.set_fact:
+        norm_after: "{{ mdatp_after.stdout | default('') | trim }}"
+        norm_other_repos: "{{ other_ms_repos.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+
+
+- name: Repo normalization summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    norm_hosts: "{{ groups['all'] | difference(['localhost']) | sort }}"
+
+  tasks:
+
+    # Hosts that failed outside the block (unreachable, sudo, etc.) never
+    # set norm_status and are listed as FAILED / UNREACHABLE.
+    - name: Build summary
+      ansible.builtin.set_fact:
+        norm_report: |-
+          {% set ns = namespace(ok=[], rb=[], sk=[], unk=[], other=[]) %}
+          {% for h in norm_hosts %}
+          {% set hv = hostvars[h] %}
+          {% set s = hv.norm_status | default('unknown') %}
+          {% if s == 'normalized' %}
+          {% set cleaned = (hv.norm_cleaned | default(0) | int) %}
+          {% set ns.ok = ns.ok + [h ~ '  ' ~ hv.ms_repo_path ~ '  ' ~ (hv.norm_before or '-') ~ ' -> ' ~ (hv.norm_after or '-') ~ (('  (cleaned ' ~ cleaned ~ ' file(s))') if cleaned > 0 else '')] %}
+          {% elif s == 'rolled_back' %}
+          {% set ns.rb = ns.rb + [h ~ ': ' ~ hv.norm_note] %}
+          {% elif s == 'skipped' %}
+          {% set ns.sk = ns.sk + [h ~ ': ' ~ hv.norm_note] %}
+          {% else %}
+          {% set ns.unk = ns.unk + [h] %}
+          {% endif %}
+          {% for l in hv.norm_other_repos | default([]) %}
+          {% set ns.other = ns.other + [h ~ ': ' ~ l] %}
+          {% endfor %}
+          {% endfor %}
+          Normalized: {{ ns.ok | length }}   Rolled back: {{ ns.rb | length }}   Skipped: {{ ns.sk | length }}   Failed/unreachable: {{ ns.unk | length }}   (of {{ norm_hosts | length }})
+
+          {% for title, items in [('ROLLED BACK', ns.rb), ('FAILED / UNREACHABLE', ns.unk), ('SKIPPED', ns.sk), ('NORMALIZED  (repo  before -> after)', ns.ok), ('OTHER MICROSOFT REPOS LEFT IN PLACE', ns.other)] if items %}
+          {{ title }}:
+          {% for i in items %}
+          - {{ i }}
+          {% endfor %}
+
+          {% endfor %}
+
+    - name: Print summary
+      ansible.builtin.debug:
+        msg: "{{ norm_report.splitlines() }}"
