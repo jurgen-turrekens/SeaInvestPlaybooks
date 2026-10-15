@@ -1,0 +1,193 @@
+---
+# MDE repo diagnostics
+#
+# Read-only apart from refreshing the apt cache. For every host it shows
+# why `apt state=latest` is not moving mdatp forward: which Microsoft repo
+# apt uses, which versions that repo offers, holds, apt proxy settings and
+# any errors from `apt-get update`.
+#
+# Run it from a copy of the MDE job template (same inventory, same
+# credentials / per-host vars), just pointing at this playbook.
+
+- name: MDE Repo Diagnostics
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    # Refresh first so the candidate version reflects what the repo offers
+    # right now. Don't fail on errors - a repo that can't be fetched (404,
+    # TLS inspection, expired key, proxy) is exactly what we want to see.
+    - name: Refresh apt cache (capture errors instead of failing)
+      ansible.builtin.command: apt-get update
+      environment:
+        LC_ALL: C
+      register: diag_apt_update
+      changed_when: false
+      failed_when: false
+
+    - name: Get OS release and architecture
+      ansible.builtin.shell: . /etc/os-release && echo "$PRETTY_NAME ($(dpkg --print-architecture))"
+      register: diag_os
+      changed_when: false
+      failed_when: false
+
+    - name: Get apt policy for mdatp (installed vs candidate)
+      ansible.builtin.command: apt-cache policy mdatp
+      environment:
+        LC_ALL: C
+      register: diag_policy
+      changed_when: false
+      failed_when: false
+
+    - name: List mdatp versions available per repo
+      ansible.builtin.command: apt-cache madison mdatp
+      environment:
+        LC_ALL: C
+      register: diag_madison
+      changed_when: false
+      failed_when: false
+
+    - name: List held packages
+      ansible.builtin.command: apt-mark showhold
+      register: diag_hold
+      changed_when: false
+      failed_when: false
+
+    # Matches both one-line (.list) and deb822 (.sources, "URIs:") formats.
+    - name: Find Microsoft repo definitions
+      ansible.builtin.shell: >-
+        grep -rhs 'packages\.microsoft\.com' /etc/apt/sources.list /etc/apt/sources.list.d/
+        | grep -vE '^[[:space:]]*#'
+      register: diag_repo
+      changed_when: false
+      failed_when: false
+
+    - name: Show apt proxy configuration
+      ansible.builtin.shell: apt-config dump | grep -iE 'Acquire::.*Proxy'
+      register: diag_proxy
+      changed_when: false
+      failed_when: false
+
+    - name: Get mdatp release ring
+      ansible.builtin.shell: mdatp health --field release_ring 2>/dev/null | tail -n1 | tr -d '"'
+      register: diag_ring
+      changed_when: false
+      failed_when: false
+
+    - name: Set diagnostic facts
+      ansible.builtin.set_fact:
+        diag_collected: true
+        diag_os_name: "{{ (diag_os.stdout | default('') | trim) or 'unknown' }}"
+        diag_installed: "{{ diag_policy.stdout | default('') | regex_search('Installed:\\s*(\\S+)', '\\1') | default(['?'], true) | first }}"
+        diag_candidate: "{{ diag_policy.stdout | default('') | regex_search('Candidate:\\s*(\\S+)', '\\1') | default(['?'], true) | first }}"
+        diag_available: "{{ diag_madison.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+        diag_held: "{{ 'mdatp' in (diag_hold.stdout_lines | default([])) }}"
+        diag_repo_lines: "{{ diag_repo.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+        diag_proxy_lines: "{{ diag_proxy.stdout_lines | default([]) | map('trim') | reject('equalto', '') | list }}"
+        diag_ring_value: "{{ (diag_ring.stdout | default('') | trim) or 'unknown' }}"
+        diag_apt_errors: >-
+          {{
+            ((diag_apt_update.stdout_lines | default([])) + (diag_apt_update.stderr_lines | default([])))
+            | select('match', '^(Err|E:|W:)') | list
+          }}
+
+
+- name: MDE Repo Diagnostics Summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    diag_hosts: "{{ groups['all'] | difference(['localhost']) | sort }}"
+    bad_versions: ['', '?', '(none)']
+
+  tasks:
+
+    - name: Determine newest installed mdatp build in the fleet
+      ansible.builtin.set_fact:
+        fleet_max: >-
+          {%- set ns = namespace(v='0') -%}
+          {%- for h in diag_hosts -%}
+          {%- set v = hostvars[h].diag_installed | default('?') -%}
+          {%- if v not in bad_versions and v is version(ns.v, '>') -%}
+          {%- set ns.v = v -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ ns.v }}
+
+    - name: Classify hosts
+      ansible.builtin.set_fact:
+        diag_flags: "{{ diag_flags | default({}) | combine({item: (host_flags | from_json)}) }}"
+      vars:
+        host_flags: >-
+          {%- set hv = hostvars[item] -%}
+          {%- set f = [] -%}
+          {%- if not (hv.diag_collected | default(false)) -%}
+          {%- set _ = f.append('NO DATA - host failed or unreachable') -%}
+          {%- else -%}
+          {%- set inst = hv.diag_installed -%}
+          {%- set cand = hv.diag_candidate -%}
+          {%- if hv.diag_repo_lines | length == 0 -%}
+          {%- set _ = f.append('NO MICROSOFT REPO CONFIGURED') -%}
+          {%- endif -%}
+          {%- if hv.diag_held -%}
+          {%- set _ = f.append('MDATP IS HELD') -%}
+          {%- endif -%}
+          {%- if hv.diag_apt_errors | length > 0 -%}
+          {%- set _ = f.append('APT UPDATE ERRORS') -%}
+          {%- endif -%}
+          {%- if inst in bad_versions -%}
+          {%- set _ = f.append('MDATP NOT INSTALLED VIA APT') -%}
+          {%- elif cand not in bad_versions and cand is version(inst, '>') -%}
+          {%- set _ = f.append('NEWER CANDIDATE ' ~ cand ~ ' NOT INSTALLED') -%}
+          {%- elif inst is version(fleet_max, '<') -%}
+          {%- set _ = f.append('BEHIND FLEET - REPO OFFERS NOTHING NEWER') -%}
+          {%- endif -%}
+          {%- endif -%}
+          {{ f | to_json }}
+      loop: "{{ diag_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Build report
+      ansible.builtin.set_fact:
+        diag_report: |-
+          Newest installed build in fleet: {{ fleet_max }}
+          Hosts with findings: {{ diag_hosts | select('in', diag_flags | dict2items | selectattr('value') | map(attribute='key') | list) | list | length }} / {{ diag_hosts | length }}
+
+          {% for pass in ['problem', 'ok'] %}
+          {% if pass == 'problem' %}===== HOSTS WITH FINDINGS ====={% else %}===== OK ====={% endif %}
+
+          {% for h in diag_hosts %}
+          {% set flags = diag_flags[h] | default([]) %}
+          {% if (pass == 'problem' and flags | length > 0) or (pass == 'ok' and flags | length == 0) %}
+          {% set hv = hostvars[h] %}
+          {{ h }}{{ '  [' ~ (flags | join('; ')) ~ ']' if flags else '' }}
+          {% if hv.diag_collected | default(false) %}
+              OS         : {{ hv.diag_os_name }}
+              Installed  : {{ hv.diag_installed }}
+              Candidate  : {{ hv.diag_candidate }}
+              Ring       : {{ hv.diag_ring_value }}
+          {% for r in hv.diag_repo_lines %}
+              {{ 'Repo       : ' if loop.first else '             ' }}{{ r }}
+          {% endfor %}
+          {% for a in hv.diag_available[:3] %}
+              {{ 'Available  : ' if loop.first else '             ' }}{{ a }}
+          {% endfor %}
+          {% for p in hv.diag_proxy_lines %}
+              {{ 'Apt proxy  : ' if loop.first else '             ' }}{{ p }}
+          {% endfor %}
+          {% for e in hv.diag_apt_errors %}
+              {{ 'Apt errors : ' if loop.first else '             ' }}{{ e }}
+          {% endfor %}
+          {% endif %}
+
+          {% endif %}
+          {% endfor %}
+          {% endfor %}
+
+    - name: Print MDE repo diagnostics
+      ansible.builtin.debug:
+        msg: "{{ diag_report.splitlines() }}"
