@@ -10,8 +10,8 @@
 #   4. Removes every other ubuntu|debian/*/prod entry (duplicates, wrong
 #      distro, old releases) from .list and .sources files. Other Microsoft
 #      product repos (e.g. repos/azure-cli) are left alone and reported.
-#   5. Installs the Microsoft key as a dedicated keyring and writes one
-#      signed-by entry to /etc/apt/sources.list.d/microsoft-prod.list.
+#   5. Installs the Microsoft keys (classic + 2025) as dedicated keyrings and
+#      writes one signed-by entry to /etc/apt/sources.list.d/microsoft-prod.list.
 #   6. apt-get update must succeed and mdatp must be offered by the new repo.
 #      If not, the sources backup is restored and the host is reported as
 #      rolled back with the reason.
@@ -28,9 +28,16 @@
     - min
 
   vars:
-    ms_key_url: https://packages.microsoft.com/keys/microsoft.asc
-    ms_key_local: /tmp/microsoft-prod.asc
-    ms_keyring: /usr/share/keyrings/microsoft-prod.asc
+    # Microsoft signs older repos with microsoft.asc and newer ones (e.g.
+    # ubuntu/26.04) with a newer key. The repo line trusts both, so the same
+    # entry works on every release.
+    ms_keys:
+      - url: https://packages.microsoft.com/keys/microsoft.asc
+        local: /tmp/microsoft-prod.asc
+        keyring: /usr/share/keyrings/microsoft-prod.asc
+      - url: https://packages.microsoft.com/keys/microsoft-2025.asc
+        local: /tmp/microsoft-prod-2025.asc
+        keyring: /usr/share/keyrings/microsoft-prod-2025.asc
     ms_list_file: /etc/apt/sources.list.d/microsoft-prod.list
     # Matches the per-distro "prod" repos only - not product repos such as
     # packages.microsoft.com/repos/azure-cli.
@@ -47,11 +54,14 @@
       delegate_facts: true
       run_once: true
 
-    - name: Download Microsoft signing key on the controller
+    - name: Download Microsoft signing keys on the controller
       ansible.builtin.get_url:
-        url: "{{ ms_key_url }}"
-        dest: "{{ ms_key_local }}"
+        url: "{{ item.url }}"
+        dest: "{{ item.local }}"
         mode: '0644'
+      loop: "{{ ms_keys }}"
+      loop_control:
+        label: "{{ item.url | basename }}"
       delegate_to: localhost
       run_once: true
       become: false
@@ -202,13 +212,16 @@
           loop: "{{ (sources_classified | from_json).delete }}"
           register: sources_deleted
 
-        - name: Install Microsoft signing key as a dedicated keyring
+        - name: Install Microsoft signing keys as dedicated keyrings
           ansible.builtin.copy:
-            src: "{{ ms_key_local }}"
-            dest: "{{ ms_keyring }}"
+            src: "{{ item.local }}"
+            dest: "{{ item.keyring }}"
             owner: root
             group: root
             mode: '0644'
+          loop: "{{ ms_keys }}"
+          loop_control:
+            label: "{{ item.keyring }}"
 
         - name: Write the single Microsoft prod repo entry
           ansible.builtin.copy:
@@ -218,7 +231,7 @@
             mode: '0644'
             content: |
               # Managed by Ansible (mde-repo-normalize.yml) - do not edit
-              deb [arch={{ deb_arch.stdout | trim }} signed-by={{ ms_keyring }}] https://packages.microsoft.com/{{ ms_repo_path }} {{ ms_codename }} main
+              deb [arch={{ deb_arch.stdout | trim }} signed-by={{ ms_keys | map(attribute='keyring') | join(',') }}] https://packages.microsoft.com/{{ ms_repo_path }} {{ ms_codename }} main
           register: list_written
 
         - name: Refresh apt cache with the new repo
