@@ -1,0 +1,205 @@
+---
+# PHP2Shell (CVE-2026-109618 / CVE-2026-109619) - read-only exposure check
+#
+# Reports per host, per PHP install:
+#   PATCHED     - CVE id found in the package changelog (distro backport),
+#                 or upstream version >= fixed version for that branch
+#   VULNERABLE  - anything else (incl. EOL branches < 8.2: no upstream fix)
+#   NOT_INSTALLED
+#
+# Covers dpkg (Debian/Ubuntu, incl. sury.org) and rpm (RHEL/Rocky/Alma, Remi SCL,
+# cPanel ea-php) packages, plus PHP binaries not owned by any package.
+# Makes no changes to the hosts.
+#
+# !! php2shell_fixed_versions are the EXPECTED fixed releases (not confirmed by
+# !! php.net until the 21 Oct 2026 14:00 UTC release). Verify and adjust.
+#
+# Usage:
+#   ansible-playbook php2shell_check.yml -e target_hosts=linux
+#   AWX: set target_hosts as extra var; summary also published via set_stats.
+
+- name: PHP2Shell exposure check
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  gather_facts: false
+  vars:
+    php2shell_fixed_versions:
+      "8.5": "8.5.12"
+      "8.4": "8.4.27"
+      "8.3": "8.3.36"
+      "8.2": "8.2.35"
+    php2shell_python: "{{ ansible_python_interpreter | default(discovered_interpreter_python) | default('/usr/bin/python3') }}"
+
+  tasks:
+    - name: Remember target host list for the summary play
+      ansible.builtin.set_fact:
+        php2shell_targets: "{{ ansible_play_hosts_all }}"
+      run_once: true
+      delegate_to: localhost
+      delegate_facts: true
+
+    - name: Inventory PHP installs and evaluate against PHP2Shell
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          {{ php2shell_python }} - <<'PYEOF'
+          {% raw %}
+          import glob, gzip, json, os, re, shutil, subprocess
+
+          FIXED = json.loads(os.environ.get('PHP2SHELL_FIXED') or '{}')
+          CVES = ('CVE-2026-109618', 'CVE-2026-109619')
+
+          def run(cmd, timeout=20):
+              try:
+                  return subprocess.check_output(
+                      cmd, stderr=subprocess.DEVNULL, universal_newlines=True,
+                      timeout=timeout, env=dict(os.environ, LC_ALL='C')).strip()
+              except Exception:
+                  return None
+
+          def vt(v):
+              return tuple(int(x) for x in re.findall(r'\d+', v or '')[:3])
+
+          def branch_of(v):
+              m = re.match(r'(\d+)\.(\d+)', v or '')
+              return '{}.{}'.format(*m.groups()) if m else None
+
+          def judge(branch, upstream, cve_hit):
+              if cve_hit:
+                  return 'PATCHED', 'CVE ids in package changelog'
+              fx = FIXED.get(branch)
+              if fx and upstream and vt(upstream) >= vt(fx):
+                  return 'PATCHED', '{} >= {}'.format(upstream, fx)
+              if branch and vt(branch) < (8, 2):
+                  return 'VULNERABLE', 'EOL branch {}: no upstream fix, distro backport only'.format(branch)
+              if not fx:
+                  return 'VULNERABLE', 'no fixed version known for branch {}'.format(branch)
+              return 'VULNERABLE', '{} < {} and CVE not in changelog'.format(upstream, fx)
+
+          installs = []
+
+          # --- Debian / Ubuntu (distro + sury.org) ---------------------------------
+          if shutil.which('dpkg-query'):
+              out = run(['dpkg-query', '-W', '-f=${Package}\t${Version}\t${db:Status-Abbrev}\n']) or ''
+              for line in out.splitlines():
+                  parts = line.split('\t')
+                  if len(parts) != 3 or not parts[2].startswith('ii'):
+                      continue
+                  name, ver, _ = parts
+                  m = re.match(r'^php(\d+\.\d+)-common$', name)
+                  if not m:
+                      continue
+                  branch = m.group(1)
+                  up = re.match(r'^(?:\d+:)?(\d+\.\d+\.\d+)', ver)
+                  up = up.group(1) if up else ver
+                  hit = False
+                  for cl in glob.glob('/usr/share/doc/php{}-*/changelog.Debian*'.format(branch)):
+                      try:
+                          opener = gzip.open if cl.endswith('.gz') else open
+                          with opener(cl, 'rt', errors='ignore') as f:
+                              if any(c in f.read() for c in CVES):
+                                  hit = True
+                                  break
+                      except Exception:
+                          pass
+                  st, why = judge(branch, up, hit)
+                  installs.append(dict(source='dpkg', name=name, version=ver, branch=branch, status=st, reason=why))
+
+          # --- RHEL family (AppStream, Remi, SCL, cPanel ea-php) --------------------
+          if shutil.which('rpm'):
+              out = run(['rpm', '-qa', '--qf', '%{NAME}\t%{VERSION}\t%{RELEASE}\n']) or ''
+              for line in out.splitlines():
+                  parts = line.split('\t')
+                  if len(parts) != 3:
+                      continue
+                  name, ver, rel = parts
+                  if not re.match(r'^(php\d*|php\d+-php|ea-php\d+-php|rh-php\d+-php)-common$', name):
+                      continue
+                  branch = branch_of(ver)
+                  cl = run(['rpm', '-q', '--changelog', name]) or ''
+                  st, why = judge(branch, ver, any(c in cl for c in CVES))
+                  installs.append(dict(source='rpm', name=name, version='{}-{}'.format(ver, rel),
+                                       branch=branch, status=st, reason=why))
+
+          # --- PHP binaries not owned by any package (source builds, vendor bundles) -
+          pats = ['/usr/local/bin/php*', '/usr/local/sbin/php-fpm*', '/usr/bin/php*', '/usr/sbin/php-fpm*',
+                  '/opt/*/bin/php', '/opt/*/*/bin/php', '/opt/*/*/*/bin/php']
+          seen = set()
+          for pat in pats:
+              for p in glob.glob(pat):
+                  if not re.search(r'/php(-fpm|-cgi)?[\d.]*$', p):
+                      continue
+                  rp = os.path.realpath(p)
+                  if rp in seen or not (os.path.isfile(rp) and os.access(rp, os.X_OK)):
+                      continue
+                  seen.add(rp)
+                  owned = False
+                  if shutil.which('dpkg') and (run(['dpkg', '-S', rp]) or run(['dpkg', '-S', p])):
+                      owned = True
+                  if shutil.which('rpm') and run(['rpm', '-qf', rp]) and 'not owned' not in (run(['rpm', '-qf', rp]) or ''):
+                      owned = True
+                  if owned:
+                      continue
+                  m = re.search(r'PHP (\d+\.\d+\.\d+)', run([rp, '-v'], timeout=10) or '')
+                  if not m:
+                      continue
+                  ver = m.group(1)
+                  st, why = judge(branch_of(ver), ver, False)
+                  installs.append(dict(source='unmanaged', name=rp, version=ver,
+                                       branch=branch_of(ver), status=st, reason=why))
+
+          if not installs:
+              overall = 'NOT_INSTALLED'
+          elif any(i['status'] == 'VULNERABLE' for i in installs):
+              overall = 'VULNERABLE'
+          else:
+              overall = 'PATCHED'
+
+          print(json.dumps(dict(
+              status=overall,
+              installs=installs,
+              summary=['{:<10} {:<28} {:<40} {}'.format(i['status'], i['name'], i['version'], i['reason'])
+                       for i in installs])))
+          {% endraw %}
+          PYEOF
+      environment:
+        PHP2SHELL_FIXED: "{{ php2shell_fixed_versions | to_json }}"
+      register: php2shell_raw
+      changed_when: false
+
+    - name: Parse result
+      ansible.builtin.set_fact:
+        php2shell: "{{ php2shell_raw.stdout | from_json }}"
+
+    - name: Host report
+      ansible.builtin.debug:
+        msg: "{{ ['STATUS: ' ~ php2shell.status] + php2shell.summary }}"
+
+- name: PHP2Shell fleet summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Build summary
+      ansible.builtin.set_fact:
+        php2shell_fleet: >-
+          {%- set out = {} -%}
+          {%- for h in hostvars['localhost'].php2shell_targets | default([]) | sort -%}
+          {%- set _ = out.update({h: hostvars[h].php2shell.status
+                                     if hostvars[h].php2shell is defined
+                                     else 'NO_DATA (unreachable/failed)'}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Fleet summary
+      ansible.builtin.debug:
+        msg:
+          - "VULNERABLE    ({{ php2shell_fleet | dict2items | selectattr('value', 'eq', 'VULNERABLE') | list | length }}): {{ php2shell_fleet | dict2items | selectattr('value', 'eq', 'VULNERABLE') | map(attribute='key') | join(', ') }}"
+          - "PATCHED       ({{ php2shell_fleet | dict2items | selectattr('value', 'eq', 'PATCHED') | list | length }}): {{ php2shell_fleet | dict2items | selectattr('value', 'eq', 'PATCHED') | map(attribute='key') | join(', ') }}"
+          - "NOT_INSTALLED ({{ php2shell_fleet | dict2items | selectattr('value', 'eq', 'NOT_INSTALLED') | list | length }})"
+          - "NO_DATA       ({{ php2shell_fleet | dict2items | selectattr('value', 'match', 'NO_DATA') | list | length }}): {{ php2shell_fleet | dict2items | selectattr('value', 'match', 'NO_DATA') | map(attribute='key') | join(', ') }}"
+
+    - name: Publish to AWX job artifacts
+      ansible.builtin.set_stats:
+        data:
+          php2shell_fleet: "{{ php2shell_fleet }}"
+        per_host: false
