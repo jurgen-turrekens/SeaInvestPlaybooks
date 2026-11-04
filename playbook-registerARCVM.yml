@@ -5,9 +5,8 @@
 # (SI-PA-Forward-Trust -> Sea-Invest Issuing CA01 -> Sea-Invest Root CA), so the
 # internal CA chain must be trusted on the host before anything talks to Azure.
 #
-# Required files next to this playbook (PEM format):
-#   files/SeaInvest-Root-CA.crt
-#   files/SeaInvest-Issuing-CA01.crt
+# The CA certificates are embedded below (internal_root_ca_pem /
+# internal_issuing_ca_pem) - no extra files needed in the project.
 
 - name: Register Debian VMs to Azure Arc
   hosts: all
@@ -35,6 +34,16 @@
     # Pinned so a wrong or tampered root can never land in the trust store
     internal_root_ca_sha256: "02:BB:64:29:D8:5E:4A:78:A5:81:F2:C8:21:F3:99:D2:51:FE:2D:C4:4C:23:C1:A5:03:1E:37:2C:C2:FE:76:C4"
 
+    # Paste the PEMs here (output of: cat /tmp/chain4.pem  /  cat /tmp/chain3.pem)
+    internal_root_ca_pem: |
+      -----BEGIN CERTIFICATE-----
+      PASTE_SEA_INVEST_ROOT_CA_HERE
+      -----END CERTIFICATE-----
+    internal_issuing_ca_pem: |
+      -----BEGIN CERTIFICATE-----
+      PASTE_SEA_INVEST_ISSUING_CA01_HERE
+      -----END CERTIFICATE-----
+
   tasks:
     - name: Verify Azure credentials are available
       ansible.builtin.assert:
@@ -59,7 +68,7 @@
 
     - name: Install Sea-Invest Root CA (fingerprint-validated)
       ansible.builtin.copy:
-        src: "files/{{ internal_root_ca_file }}"
+        content: "{{ internal_root_ca_pem }}"
         dest: "{{ ca_trust_dir }}/{{ internal_root_ca_file }}"
         owner: root
         group: root
@@ -72,7 +81,7 @@
 
     - name: Install Sea-Invest Issuing CA01 (must chain to the root)
       ansible.builtin.copy:
-        src: "files/{{ internal_issuing_ca_file }}"
+        content: "{{ internal_issuing_ca_pem }}"
         dest: "{{ ca_trust_dir }}/{{ internal_issuing_ca_file }}"
         owner: root
         group: root
@@ -135,7 +144,13 @@
 
         - name: Fail with the underlying error
           ansible.builtin.fail:
-            msg: "Azure Arc agent download/install failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('unknown error')) }}"
+            msg:
+              - "Azure Arc agent download/install failed on {{ inventory_hostname }}"
+              - "task: {{ ansible_failed_task.name | default('?') }}"
+              - "rc: {{ ansible_failed_result.rc | default('n/a') }}"
+              - "msg: {{ ansible_failed_result.msg | default('') }}"
+              - "stderr (tail): {{ (ansible_failed_result.stderr_lines | default([]))[-25:] }}"
+              - "stdout (tail): {{ (ansible_failed_result.stdout_lines | default([]))[-25:] }}"
 
       always:
         - name: Clean up installation script
