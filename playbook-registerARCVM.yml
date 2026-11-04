@@ -1,97 +1,168 @@
 ---
-- name: Register Debian VMs to Azure ARC
+# Register Debian VMs to Azure Arc
+#
+# Traffic to *.his.arc.azure.com is decrypted by the Palo Alto SSL forward proxy
+# (SI-PA-Forward-Trust -> Sea-Invest Issuing CA01 -> Sea-Invest Root CA), so the
+# internal CA chain must be trusted on the host before anything talks to Azure.
+#
+# Required files next to this playbook (PEM format):
+#   files/SeaInvest-Root-CA.crt
+#   files/SeaInvest-Issuing-CA01.crt
+
+- name: Register Debian VMs to Azure Arc
   hosts: all
-  become: yes
+  become: true
+
   vars:
-    
     subscription_id: "{{ lookup('env', 'AZURE_SUBSCRIPTION_ID') }}"
     tenant_id: "{{ lookup('env', 'AZURE_TENANT') }}"
     service_principal_id: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
     service_principal_secret: "{{ lookup('env', 'AZURE_SECRET') }}"
-    
-    
+
     resource_group: "weu-p1-arc-silver-01"
     location: "westeurope"
     cloud: "AzureCloud"
-    correlation_id: 3ade8cb6-9c79-4aba-97f9-17e66f16b957
-    
+    correlation_id: "3ade8cb6-9c79-4aba-97f9-17e66f16b957"
+
+    arc_installer_url: "https://gbl.his.arc.azure.com/azcmagent-linux"
+    arc_installer_path: "/tmp/install_linux_azcmagent.sh"
+    azcmagent_bin: "/opt/azcmagent/bin/azcmagent"
+
+    # Internal PKI used by the Palo Alto forward proxy
+    ca_trust_dir: "/usr/local/share/ca-certificates"
+    internal_root_ca_file: "SeaInvest-Root-CA.crt"
+    internal_issuing_ca_file: "SeaInvest-Issuing-CA01.crt"
+    # Pinned so a wrong or tampered root can never land in the trust store
+    internal_root_ca_sha256: "02:BB:64:29:D8:5E:4A:78:A5:81:F2:C8:21:F3:99:D2:51:FE:2D:C4:4C:23:C1:A5:03:1E:37:2C:C2:FE:76:C4"
+
   tasks:
     - name: Verify Azure credentials are available
-      assert:
+      ansible.builtin.assert:
         that:
-          - subscription_id is defined
           - subscription_id | length > 0
-          - tenant_id is defined
           - tenant_id | length > 0
-          - service_principal_id is defined
           - service_principal_id | length > 0
-          - service_principal_secret is defined
           - service_principal_secret | length > 0
         fail_msg: "Azure credentials not properly injected. Ensure the Azure credential is attached to the job template."
         success_msg: "Azure credentials verified successfully"
-   
-    - name: Download Azure Connected Machine agent
-      get_url:
-        url: https://gbl.his.arc.azure.com/azcmagent-linux
-        dest: /tmp/install_linux_azcmagent.sh
-        mode: '0755'
-        timeout: 30
-      register: download_result
-      failed_when: false
-
-    - name: Report download failure to Azure (if failed)
-      uri:
-        url: https://gbl.his.arc.azure.com/log
-        method: PUT
-        body_format: json
-        body:
-          subscriptionId: "{{ subscription_id }}"
-          resourceGroup: "{{ resource_group }}"
-          tenantId: "{{ tenant_id }}"
-          location: "{{ location }}"
-          correlationId: "{{ correlation_id }}"
-          authType: "principal"
-          operation: "onboarding"
-          messageType: "DownloadScriptFailed"
-          message: "{{ download_result.msg | default('Download failed') }}"
-        status_code: [200, 201, 204]
-      when: download_result.failed
-      failed_when: false
       no_log: true
 
-    - name: Fail if download unsuccessful
-      fail:
-        msg: "Failed to download Azure Connected Machine agent: {{ download_result.msg }}"
-      when: download_result.failed
+    # ------------------------------------------------------------------
+    # Trust the TLS-inspection chain
+    # ------------------------------------------------------------------
+    - name: Ensure ca-certificates and openssl are present
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - openssl
+        state: present
 
-    - name: Install Azure Connected Machine agent
-      command: bash /tmp/install_linux_azcmagent.sh
-      args:
-        creates: /opt/azcmagent/bin/azcmagent
-      register: install_result
+    - name: Install Sea-Invest Root CA (fingerprint-validated)
+      ansible.builtin.copy:
+        src: "files/{{ internal_root_ca_file }}"
+        dest: "{{ ca_trust_dir }}/{{ internal_root_ca_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        # Runs against the temp copy; file is only put in place if the fingerprint matches
+        validate: >-
+          sh -c '[ "$(openssl x509 -in %s -noout -fingerprint -sha256 | cut -d= -f2)"
+          = "{{ internal_root_ca_sha256 }}" ]'
+      register: root_ca_copy
 
-    - name: Verify azcmagent installation
-      command: which azcmagent
-      register: azcmagent_path
-      failed_when: false
-      changed_when: false
+    - name: Install Sea-Invest Issuing CA01 (must chain to the root)
+      ansible.builtin.copy:
+        src: "files/{{ internal_issuing_ca_file }}"
+        dest: "{{ ca_trust_dir }}/{{ internal_issuing_ca_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        validate: "openssl verify -CAfile {{ ca_trust_dir }}/{{ internal_root_ca_file }} %s"
+      register: issuing_ca_copy
 
-    - name: Check if machine is already connected to Azure ARC
-      command: azcmagent show -j
+    - name: Rebuild system trust store
+      ansible.builtin.command: update-ca-certificates
+      when: root_ca_copy is changed or issuing_ca_copy is changed
+      changed_when: true
+
+    # ------------------------------------------------------------------
+    # Install the Connected Machine agent
+    # ------------------------------------------------------------------
+    - name: Check whether azcmagent is already installed
+      ansible.builtin.stat:
+        path: "{{ azcmagent_bin }}"
+      register: azcmagent_stat
+
+    - name: Download and install Azure Connected Machine agent
+      when: not azcmagent_stat.stat.exists
+      block:
+        - name: Download Azure Connected Machine agent installer
+          ansible.builtin.get_url:
+            url: "{{ arc_installer_url }}"
+            dest: "{{ arc_installer_path }}"
+            mode: "0755"
+            timeout: 30
+          register: download_result
+          retries: 3
+          delay: 10
+          until: download_result is succeeded
+
+        - name: Install Azure Connected Machine agent
+          ansible.builtin.command: "bash {{ arc_installer_path }}"
+          args:
+            creates: "{{ azcmagent_bin }}"
+
+      rescue:
+        - name: Report download failure to Azure
+          ansible.builtin.uri:
+            url: "https://gbl.his.arc.azure.com/log"
+            method: PUT
+            body_format: json
+            body:
+              subscriptionId: "{{ subscription_id }}"
+              resourceGroup: "{{ resource_group }}"
+              tenantId: "{{ tenant_id }}"
+              location: "{{ location }}"
+              correlationId: "{{ correlation_id }}"
+              authType: "principal"
+              operation: "onboarding"
+              messageType: "DownloadScriptFailed"
+              message: "{{ download_result.msg | default('Download failed') }}"
+            status_code: [200, 201, 204]
+          when: download_result is defined and download_result is failed
+          failed_when: false
+          no_log: true
+
+        - name: Fail with the underlying error
+          ansible.builtin.fail:
+            msg: "Azure Arc agent download/install failed on {{ inventory_hostname }}: {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('unknown error')) }}"
+
+      always:
+        - name: Clean up installation script
+          ansible.builtin.file:
+            path: "{{ arc_installer_path }}"
+            state: absent
+
+    # ------------------------------------------------------------------
+    # Connect to Azure Arc
+    # ------------------------------------------------------------------
+    - name: Check if machine is already connected to Azure Arc
+      ansible.builtin.command: azcmagent show -j
       register: azcmagent_status
       failed_when: false
       changed_when: false
 
     - name: Parse connection status
-      set_fact:
-        is_connected: "{{ (azcmagent_status.rc == 0) and ('Connected' in azcmagent_status.stdout) }}"
+      ansible.builtin.set_fact:
+        # Match the quoted value so "Disconnected" never counts as connected
+        is_connected: "{{ azcmagent_status.rc == 0 and '\"Connected\"' in azcmagent_status.stdout }}"
 
     - name: Display current connection status
-      debug:
-        msg: "Machine {{ inventory_hostname }} is {{ 'already connected' if is_connected else 'not connected' }} to Azure ARC"
+      ansible.builtin.debug:
+        msg: "Machine {{ inventory_hostname }} is {{ 'already connected' if is_connected else 'not connected' }} to Azure Arc"
 
-    - name: Connect machine to Azure ARC using Service Principal
-      command: >
+    - name: Connect machine to Azure Arc using Service Principal
+      ansible.builtin.command: >
         azcmagent connect
         --service-principal-id "{{ service_principal_id }}"
         --service-principal-secret "{{ service_principal_secret }}"
@@ -103,28 +174,28 @@
         --correlation-id "{{ correlation_id }}"
       when: not is_connected
       register: connect_result
-      no_log: true
-      failed_when: 
+      no_log: true          # hides the secret on the command line
+      failed_when: false    # evaluated below so the error is actually visible
+
+    - name: Fail if connect was unsuccessful
+      ansible.builtin.fail:
+        msg: "azcmagent connect failed (rc={{ connect_result.rc }}): {{ connect_result.stderr | default('') | regex_replace(service_principal_secret, '********') }}"
+      when:
+        - connect_result is not skipped
         - connect_result.rc != 0
-        - "'already connected' not in connect_result.stderr | lower"
+        - "'already connected' not in (connect_result.stderr | default('') | lower)"
 
     - name: Verify connection after registration
-      command: azcmagent show -j
+      ansible.builtin.command: azcmagent show -j
       register: verify_status
-      when: connect_result.changed
+      when: connect_result is not skipped
       changed_when: false
 
     - name: Display final connection status
-      debug:
+      ansible.builtin.debug:
         msg: |
-          Azure ARC Registration Summary for {{ inventory_hostname }}:
-          - Status: {{ 'Successfully connected' if (connect_result.changed or is_connected) else 'Connection failed' }}
+          Azure Arc Registration Summary for {{ inventory_hostname }}:
+          - Status: {{ 'Connected' if (is_connected or (verify_status.stdout | default('') is search('"Connected"'))) else 'NOT connected' }}
           - Resource Group: {{ resource_group }}
           - Location: {{ location }}
           - Subscription: {{ subscription_id }}
-      when: connect_result.changed or is_connected
-
-    - name: Clean up installation script
-      file:
-        path: /tmp/install_linux_azcmagent.sh
-        state: absent
