@@ -1,0 +1,141 @@
+---
+# Fix half-installed Debian 12 kernel upgrades:
+#   "linux-image-amd64 : Depends: linux-image-6.1.0-XX-amd64 but it is not installed"
+#
+# What it does per host:
+#   1. Finishes any interrupted dpkg runs
+#   2. If /boot is low on space, purges old kernel images (never the running
+#      one, never the newest installed one)
+#   3. Runs apt-get -f install to pull in the missing kernel
+#   4. Verifies the kernel the metapackage wants is installed, runs update-grub
+#   5. Optionally reboots (off by default)
+#
+# Usage:
+#   ansible-playbook -i inventory fix-broken-kernel.yml -l broken_kernel
+#   ansible-playbook -i inventory fix-broken-kernel.yml -l broken_kernel -e do_reboot=true
+
+- name: Repair interrupted kernel upgrade on Debian 12
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  serial: "{{ batch_size | default(4) }}"
+  gather_facts: true
+
+  vars:
+    do_reboot: false
+    boot_min_free_mb: 150
+    apt_env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+
+  tasks:
+    - name: Only run on Debian 12
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Debian'
+          - ansible_distribution_major_version == '12'
+        fail_msg: "Skipping: {{ ansible_distribution }} {{ ansible_distribution_version }} is not Debian 12"
+
+    - name: Show running kernel
+      ansible.builtin.debug:
+        msg: "Running kernel: {{ ansible_kernel }}"
+
+    - name: Finish any interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      environment: "{{ apt_env }}"
+      register: dpkg_configure
+      changed_when: dpkg_configure.stdout | length > 0
+      failed_when: false   # may fail on the same /boot issue; handled below
+
+    - name: Check free space on /boot (MB)
+      ansible.builtin.shell: df -Pm /boot | awk 'NR==2 {print $4}'
+      register: boot_free
+      changed_when: false
+
+    - name: List removable old kernel images (excludes running + newest installed)
+      ansible.builtin.shell: |
+        set -o pipefail
+        running="linux-image-$(uname -r)"
+        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-[0-9]*' 2>/dev/null \
+          | awk '$1 ~ /^i/ {print $2}' \
+          | grep -vx "$running" \
+          | sort -V \
+          | head -n -1
+      args:
+        executable: /bin/bash
+      register: old_kernels
+      changed_when: false
+      failed_when: false
+
+    - name: Purge old kernel images to free /boot
+      ansible.builtin.command: "dpkg --purge {{ old_kernels.stdout_lines | join(' ') }}"
+      environment: "{{ apt_env }}"
+      when:
+        - boot_free.stdout | int < boot_min_free_mb
+        - old_kernels.stdout_lines | length > 0
+      register: purge_result
+
+    - name: Recheck /boot after purge
+      ansible.builtin.shell: df -Pm /boot | awk 'NR==2 {print $4}'
+      register: boot_free_after
+      changed_when: false
+
+    - name: Stop if /boot is still too full
+      ansible.builtin.fail:
+        msg: >-
+          /boot has only {{ boot_free_after.stdout }} MB free (need {{ boot_min_free_mb }}).
+          Nothing safe left to purge automatically - check by hand.
+      when: boot_free_after.stdout | int < boot_min_free_mb
+
+    - name: Refresh apt package lists
+      ansible.builtin.command: apt-get update
+      environment: "{{ apt_env }}"
+      changed_when: false
+
+    - name: Fix broken dependencies (installs the missing kernel)
+      ansible.builtin.command: >
+        apt-get -f install -y
+        -o Dpkg::Options::=--force-confdef
+        -o Dpkg::Options::=--force-confold
+      environment: "{{ apt_env }}"
+      register: fix_broken
+      changed_when: "'0 upgraded, 0 newly installed' not in fix_broken.stdout"
+
+    - name: Verify apt is consistent
+      ansible.builtin.command: apt-get check
+      changed_when: false
+
+    - name: Get kernel package required by linux-image-amd64
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg-query -W -f='${Depends}\n' linux-image-amd64 \
+          | grep -o 'linux-image-[0-9][^ ,]*' | head -n1
+      args:
+        executable: /bin/bash
+      register: target_kernel_pkg
+      changed_when: false
+
+    - name: Verify target kernel is installed
+      ansible.builtin.command: "dpkg-query -W -f='${db:Status-Abbrev}' {{ target_kernel_pkg.stdout }}"
+      register: target_status
+      changed_when: false
+      failed_when: not target_status.stdout.startswith('ii')
+
+    - name: Regenerate GRUB config
+      ansible.builtin.command: update-grub
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          - "Running:   {{ ansible_kernel }}"
+          - "Installed: {{ target_kernel_pkg.stdout }}"
+          - "Purged:    {{ old_kernels.stdout_lines if (purge_result is changed) else 'nothing' }}"
+          - "/boot free: {{ boot_free_after.stdout }} MB"
+          - "Reboot needed: {{ ('linux-image-' ~ ansible_kernel) != target_kernel_pkg.stdout }}"
+
+    - name: Reboot into new kernel
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when:
+        - do_reboot | bool
+        - ('linux-image-' ~ ansible_kernel) != target_kernel_pkg.stdout
