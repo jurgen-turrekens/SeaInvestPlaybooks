@@ -1,0 +1,83 @@
+---
+# Check whether CPUs expose AVX-512 VBMI / VBMI2 (as seen by the guest kernel)
+# Equivalent to: grep -om1 -E 'avx512[_]?vbmi' /proc/cpuinfo
+#
+# Read-only, no become needed. Works in AWX as a normal job template.
+# Usage:  ansible-playbook -i inventory check_avx512_vbmi.yml
+#         (optional) -e avx_report_file=/tmp/avx512_report.csv  -> CSV written on the controller
+
+- name: Check AVX-512 VBMI support
+  hosts: all
+  gather_facts: false
+  become: false
+
+  vars:
+    avx_report_file: ""   # set to a path to get a CSV on the controller/EE
+
+  tasks:
+    - name: Read CPU flags from /proc/cpuinfo
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep -m1 '^flags' /proc/cpuinfo | grep -oE 'avx512[_]?vbmi2?' | sort -u || true
+      args:
+        executable: /bin/bash
+      register: avx_flags
+      changed_when: false
+      failed_when: false
+
+    - name: Read CPU model
+      ansible.builtin.shell: |
+        grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'
+      register: cpu_model
+      changed_when: false
+      failed_when: false
+
+    - name: Set result facts
+      ansible.builtin.set_fact:
+        avx512_vbmi_flags: "{{ avx_flags.stdout_lines | default([]) }}"
+        avx512_vbmi_enabled: "{{ (avx_flags.stdout_lines | default([]) | length) > 0 }}"
+        cpu_model_name: "{{ cpu_model.stdout | default('unknown') }}"
+
+    - name: Report per host
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'AVX-512 VBMI PRESENT' if avx512_vbmi_enabled else 'not present' }}
+          | flags={{ avx512_vbmi_flags | join(',') | default('-', true) }}
+          | cpu={{ cpu_model_name }}
+
+- name: Summary
+  hosts: localhost
+  gather_facts: false
+  run_once: true
+
+  tasks:
+    - name: Build summary lists
+      ansible.builtin.set_fact:
+        hosts_with: >-
+          {{ groups['all'] | map('extract', hostvars) | selectattr('avx512_vbmi_enabled', 'defined') |
+             selectattr('avx512_vbmi_enabled') | map(attribute='inventory_hostname') | list }}
+        hosts_without: >-
+          {{ groups['all'] | map('extract', hostvars) | selectattr('avx512_vbmi_enabled', 'defined') |
+             rejectattr('avx512_vbmi_enabled') | map(attribute='inventory_hostname') | list }}
+        hosts_unknown: >-
+          {{ groups['all'] | map('extract', hostvars) | rejectattr('avx512_vbmi_enabled', 'defined') |
+             map(attribute='inventory_hostname') | list }}
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "AVX-512 VBMI present ({{ hosts_with | length }}): {{ hosts_with }}"
+          - "Not present ({{ hosts_without | length }}): {{ hosts_without }}"
+          - "Unreachable/unknown ({{ hosts_unknown | length }}): {{ hosts_unknown }}"
+
+    - name: Write CSV report
+      when: avx_report_file | length > 0
+      ansible.builtin.copy:
+        dest: "{{ avx_report_file }}"
+        mode: "0644"
+        content: |
+          host,avx512_vbmi,flags,cpu_model
+          {% for h in groups['all'] %}
+          {% set hv = hostvars[h] %}
+          {{ h }},{{ hv.avx512_vbmi_enabled | default('unknown') }},{{ (hv.avx512_vbmi_flags | default([])) | join(' ') }},"{{ hv.cpu_model_name | default('') }}"
+          {% endfor %}
