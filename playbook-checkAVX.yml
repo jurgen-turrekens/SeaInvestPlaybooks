@@ -1,83 +1,267 @@
 ---
-# Check whether CPUs expose AVX-512 VBMI / VBMI2 (as seen by the guest kernel)
-# Equivalent to: grep -om1 -E 'avx512[_]?vbmi' /proc/cpuinfo
+# CVE-2026-114938 (Java4Shell) exposure check
 #
-# Read-only, no become needed. Works in AWX as a normal job template.
-# Usage:  ansible-playbook -i inventory check_avx512_vbmi.yml
-#         (optional) -e avx_report_file=/tmp/avx512_report.csv  -> CSV written on the controller
+# Per host:
+#   - CPU: avx512vbmi + avx512bw as seen by the guest kernel
+#   - Every RUNNING JVM (host + containers; detected via libjvm.so in /proc/<pid>/maps,
+#     so custom launchers are caught too): real JAVA_HOME, version/vendor from its
+#     'release' file, systemd unit / container id, app hint, mitigation flags
+#     (-XX:-UseBASE64Intrinsics / -XX:UseAVX<3) from cmdline + JAVA_TOOL_OPTIONS,
+#     JDK_JAVA_OPTIONS, _JAVA_OPTIONS
+#     or -XX:DisableIntrinsic=..._base64_decodeBlock
+#   - JDKs/JREs INSTALLED on disk (common paths), running or not
+#
+# Read-only. Executes no Java binaries. Does NOT print full command lines
+# (to avoid leaking -D passwords) - only jar/main-class/app keyword.
+#
+# Needs become (root) to read other users' /proc/<pid>/{maps,environ,root}.
+# By default JVMs are only scanned on hosts that expose AVX-512 VBMI.
+#   -e scan_all=true   -> scan every host (e.g. VMs on mixed 5220/6526Y clusters)
 
-- name: Check AVX-512 VBMI support
+- name: Java4Shell exposure check
   hosts: all
   gather_facts: false
-  become: false
+  become: true
 
   vars:
-    avx_report_file: ""   # set to a path to get a CSV on the controller/EE
+    scan_all: false
 
   tasks:
-    - name: Read CPU flags from /proc/cpuinfo
+    - name: CPU flags
       ansible.builtin.shell: |
-        set -o pipefail
-        grep -m1 '^flags' /proc/cpuinfo | grep -oE 'avx512[_]?vbmi2?' | sort -u || true
+        f=$(grep -m1 '^flags' /proc/cpuinfo)
+        printf 'vbmi=%s bw=%s\n' \
+          "$(echo "$f" | grep -qw avx512vbmi && echo yes || echo no)" \
+          "$(echo "$f" | grep -qw avx512bw && echo yes || echo no)"
+        grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'
+      register: cpu
+      changed_when: false
+      failed_when: false
+
+    - name: Set CPU facts
+      ansible.builtin.set_fact:
+        j4s_cpu_line: "{{ cpu.stdout_lines[0] | default('vbmi=? bw=?') }}"
+        j4s_cpu_model: "{{ cpu.stdout_lines[1] | default('unknown') }}"
+        j4s_cpu_exposed: "{{ 'vbmi=yes bw=yes' in (cpu.stdout_lines[0] | default('')) }}"
+
+    - name: Inventory JVMs (running + installed)
+      when: j4s_cpu_exposed | bool or scan_all | bool
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        {% raw %}
+        import os, re, json, glob, pwd
+
+        def rd(p):
+            try:
+                with open(p, 'rb') as f:
+                    return f.read()
+            except Exception:
+                return None
+
+        def release(path):
+            d = {}
+            b = rd(path)
+            if b:
+                for line in b.decode(errors='replace').splitlines():
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        d[k.strip()] = v.strip().strip('"')
+            return d
+
+        def major_update(jv):
+            m = re.match(r'(?:1\.)?(\d+)(?:\.\d+)?(?:\.(\d+))?(?:_(\d+))?', jv or '')
+            if not m:
+                return None, None
+            return int(m.group(1)), int(m.group(2) or m.group(3) or 0)
+
+        VAL_OPTS = {'-cp', '-classpath', '--class-path', '-p', '--module-path',
+                    '--add-modules', '--add-opens', '--add-exports', '--add-reads',
+                    '--patch-module', '--upgrade-module-path', '--limit-modules'}
+        APP_KW = ['jenkins', 'keycloak', 'jira', 'confluence', 'bitbucket', 'atlassian',
+                  'elasticsearch', 'opensearch', 'logstash', 'kafka', 'zookeeper',
+                  'catalina', 'tomcat', 'jboss', 'wildfly', 'sonar', 'nexus', 'gradle',
+                  'maven', 'agent.jar', 'remoting', 'spring', 'quarkus', 'solr',
+                  'activemq', 'cassandra', 'neo4j', 'unifi', 'mycus', 'iprotect',
+                  'step', 'nms']
+
+        try:
+            hst = os.stat('/')
+        except Exception:
+            hst = None
+
+        jvms = []
+        for pid in sorted(filter(str.isdigit, os.listdir('/proc')), key=int):
+            maps = rd(f'/proc/{pid}/maps')
+            if not maps:
+                continue
+            m = re.search(rb'(\S+/libjvm\.so)', maps)
+            if not m:
+                continue
+            libjvm = m.group(1).decode(errors='replace')
+            root = f'/proc/{pid}/root'
+
+            in_ctr = None
+            try:
+                st = os.stat(root)
+                in_ctr = (st.st_dev, st.st_ino) != (hst.st_dev, hst.st_ino)
+            except Exception:
+                pass
+
+            home, rel = os.path.dirname(libjvm), {}
+            for _ in range(5):
+                home = os.path.dirname(home)
+                rel = release(root + home + '/release')
+                if rel:
+                    break
+            if not rel:
+                home = os.path.dirname(os.path.dirname(os.path.dirname(libjvm)))
+
+            cmd = [c.decode(errors='replace') for c in (rd(f'/proc/{pid}/cmdline') or b'').split(b'\0') if c]
+            envs = {}
+            for e in (rd(f'/proc/{pid}/environ') or b'').split(b'\0'):
+                e = e.decode(errors='replace')
+                if '=' in e:
+                    k, v = e.split('=', 1)
+                    if k in ('JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS'):
+                        envs[k] = v.split()
+            opts = envs.get('JAVA_TOOL_OPTIONS', []) + envs.get('JDK_JAVA_OPTIONS', []) \
+                + cmd[1:] + envs.get('_JAVA_OPTIONS', [])
+
+            b64, avx = None, None
+            for o in opts:
+                if o.startswith('-XX:DisableIntrinsic=') and '_base64_decodeBlock' in o:
+                    b64 = False
+                if o == '-XX:-UseBASE64Intrinsics':
+                    b64 = False
+                elif o == '-XX:+UseBASE64Intrinsics':
+                    b64 = True
+                mm = re.match(r'-XX:UseAVX=(\d+)$', o)
+                if mm:
+                    avx = int(mm.group(1))
+            argfile = any(o.startswith('@') or o.startswith('-XX:VMOptionsFile') or o.startswith('-XX:Flags=') for o in opts)
+
+            app = '?'
+            for i, c in enumerate(cmd[1:], 1):
+                if c == '-jar' and i + 1 < len(cmd):
+                    app = 'jar:' + os.path.basename(cmd[i + 1]); break
+                if c in ('-m', '--module') and i + 1 < len(cmd):
+                    app = 'mod:' + cmd[i + 1]; break
+                if not c.startswith('-') and cmd[i - 1] not in VAL_OPTS \
+                        and re.match(r'^[\w$]+(\.[\w$]+)*(\.java)?$', c):
+                    app = 'main:' + c; break
+            low = ' '.join(cmd).lower()
+            kw = [k for k in APP_KW if k in low]
+
+            cg = (rd(f'/proc/{pid}/cgroup') or b'').decode(errors='replace')
+            units = re.findall(r'([\w@.\-\\]+\.(?:service|scope))', cg)
+            unit = units[-1] if units else '-'
+            cid = re.search(r'(docker|libpod|crio|cri-containerd)-([0-9a-f]{12})', cg)
+            ctr = f'{cid.group(1)}:{cid.group(2)}' if cid else ('yes' if in_ctr else 'no')
+
+            try:
+                uid = os.stat(f'/proc/{pid}').st_uid
+                try:
+                    user = pwd.getpwuid(uid).pw_name
+                except KeyError:
+                    user = str(uid)
+            except Exception:
+                user = '?'
+
+            jv = rel.get('JAVA_VERSION', '')
+            major, upd = major_update(jv)
+            mitigated = (b64 is False) or (avx is not None and avx < 3)
+            if major is None:
+                verdict = 'UNKNOWN-VERSION'
+            elif major < 17 or (major == 17 and upd < 6):
+                verdict = 'NOT-AFFECTED-VERSION'
+            elif mitigated:
+                verdict = 'MITIGATED-FLAG'
+            else:
+                verdict = 'CHECK-PATCH'
+
+            d = dict(
+                pid=int(pid), user=user, unit=unit, ctr=ctr, app=app, kw=','.join(kw) or '-',
+                ver=rel.get('JAVA_RUNTIME_VERSION') or jv or '?', vendor=rel.get('IMPLEMENTOR', '?'),
+                home=home, b64=('off' if b64 is False else 'on' if b64 else 'default'),
+                avx=('default' if avx is None else avx), argfile=argfile, verdict=verdict)
+            d['line'] = ('RUNNING {verdict} | ver={ver} | vendor={vendor} | app={app} kw={kw} | '
+                         'unit={unit} ctr={ctr} user={user} pid={pid} | home={home} | '
+                         'b64intr={b64} useavx={avx} argfile={argfile}').format(**d)
+            jvms.append(d)
+
+        installed, seen = [], set()
+        pats = ['/usr/lib/jvm/*/release', '/usr/lib64/jvm/*/release', '/usr/java/*/release',
+                '/usr/local/*/release', '/usr/local/*/*/release',
+                '/opt/*/release', '/opt/*/*/release', '/opt/*/*/*/release', '/opt/*/*/*/*/release',
+                '/srv/*/*/release', '/home/*/.sdkman/candidates/java/*/release',
+                '/var/lib/jenkins/tools/*/*/release', '/root/.jdks/*/release']
+        for pat in pats:
+            for p in glob.glob(pat):
+                try:
+                    rp = os.path.realpath(p)
+                except Exception:
+                    continue
+                if rp in seen:
+                    continue
+                r = release(rp)
+                if 'JAVA_VERSION' not in r:
+                    continue
+                seen.add(rp)
+                installed.append(dict(line='INSTALLED ver={} | vendor={} | home={}'.format(
+                    r.get('JAVA_RUNTIME_VERSION') or r['JAVA_VERSION'],
+                    r.get('IMPLEMENTOR', '?'), os.path.dirname(rp))))
+
+        print(json.dumps(dict(jvms=jvms, installed=installed)))
+        {% endraw %}
+        PY
       args:
         executable: /bin/bash
-      register: avx_flags
+      register: inv
       changed_when: false
       failed_when: false
 
-    - name: Read CPU model
-      ansible.builtin.shell: |
-        grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'
-      register: cpu_model
-      changed_when: false
-      failed_when: false
-
-    - name: Set result facts
+    - name: Parse inventory
       ansible.builtin.set_fact:
-        avx512_vbmi_flags: "{{ avx_flags.stdout_lines | default([]) }}"
-        avx512_vbmi_enabled: "{{ (avx_flags.stdout_lines | default([]) | length) > 0 }}"
-        cpu_model_name: "{{ cpu_model.stdout | default('unknown') }}"
+        j4s: "{{ (inv.stdout | default('') | length > 0) | ternary(inv.stdout | default('{}') | from_json, {'jvms': [], 'installed': [], 'error': (inv.stderr | default('skipped'))[-200:]}) }}"
 
-    - name: Report per host
+    - name: Flag host
+      ansible.builtin.set_fact:
+        j4s_has_check: "{{ (j4s.jvms | default([]) | selectattr('verdict', 'eq', 'CHECK-PATCH') | list | length) > 0 }}"
+        j4s_has_jvm: "{{ (j4s.jvms | default([]) | length) > 0 }}"
+
+    - name: Report
       ansible.builtin.debug:
         msg: >-
-          {{ 'AVX-512 VBMI PRESENT' if avx512_vbmi_enabled else 'not present' }}
-          | flags={{ avx512_vbmi_flags | join(',') | default('-', true) }}
-          | cpu={{ cpu_model_name }}
+          {{
+            ['CPU ' ~ j4s_cpu_line ~ ' | ' ~ j4s_cpu_model ~ ' | scanned=' ~ ((j4s_cpu_exposed | bool or scan_all | bool) | string)]
+            + (j4s.error is defined) | ternary(['ERROR ' ~ (j4s.error | default(''))], [])
+            + ((j4s.jvms | default([]) | length == 0) | ternary(['RUNNING none'], []))
+            + (j4s.jvms | default([]) | map(attribute='line') | list)
+            + (j4s.installed | default([]) | map(attribute='line') | list)
+          }}
 
 - name: Summary
   hosts: localhost
   gather_facts: false
-  run_once: true
+  become: false
 
   tasks:
-    - name: Build summary lists
+    - name: Build summary
       ansible.builtin.set_fact:
-        hosts_with: >-
-          {{ groups['all'] | map('extract', hostvars) | selectattr('avx512_vbmi_enabled', 'defined') |
-             selectattr('avx512_vbmi_enabled') | map(attribute='inventory_hostname') | list }}
-        hosts_without: >-
-          {{ groups['all'] | map('extract', hostvars) | selectattr('avx512_vbmi_enabled', 'defined') |
-             rejectattr('avx512_vbmi_enabled') | map(attribute='inventory_hostname') | list }}
-        hosts_unknown: >-
-          {{ groups['all'] | map('extract', hostvars) | rejectattr('avx512_vbmi_enabled', 'defined') |
-             map(attribute='inventory_hostname') | list }}
+        s_check: >-
+          {{ groups['all'] | map('extract', hostvars) | selectattr('j4s', 'defined')
+             | selectattr('j4s_has_check', 'defined') | selectattr('j4s_has_check')
+             | map(attribute='inventory_hostname') | list }}
+        s_nojvm: >-
+          {{ groups['all'] | map('extract', hostvars) | selectattr('j4s', 'defined')
+             | selectattr('j4s_cpu_exposed') | rejectattr('j4s_has_jvm') | map(attribute='inventory_hostname') | list }}
+        s_unreach: >-
+          {{ groups['all'] | map('extract', hostvars) | rejectattr('j4s_cpu_line', 'defined')
+             | map(attribute='inventory_hostname') | list }}
 
     - name: Summary
       ansible.builtin.debug:
         msg:
-          - "AVX-512 VBMI present ({{ hosts_with | length }}): {{ hosts_with }}"
-          - "Not present ({{ hosts_without | length }}): {{ hosts_without }}"
-          - "Unreachable/unknown ({{ hosts_unknown | length }}): {{ hosts_unknown }}"
-
-    - name: Write CSV report
-      when: avx_report_file | length > 0
-      ansible.builtin.copy:
-        dest: "{{ avx_report_file }}"
-        mode: "0644"
-        content: |
-          host,avx512_vbmi,flags,cpu_model
-          {% for h in groups['all'] %}
-          {% set hv = hostvars[h] %}
-          {{ h }},{{ hv.avx512_vbmi_enabled | default('unknown') }},{{ (hv.avx512_vbmi_flags | default([])) | join(' ') }},"{{ hv.cpu_model_name | default('') }}"
-          {% endfor %}
+          - "VBMI hosts with running JVM in affected line, not mitigated ({{ s_check | length }}): {{ s_check }}"
+          - "VBMI hosts with no running JVM ({{ s_nojvm | length }}): {{ s_nojvm }}"
+          - "Unreachable/unknown ({{ s_unreach | length }}): {{ s_unreach }}"
