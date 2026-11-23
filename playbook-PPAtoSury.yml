@@ -1,0 +1,245 @@
+---
+# Migrate Ubuntu hosts from the deprecated ppa:ondrej/php to packages.sury.org/php,
+# verify apt update is clean, and point unattended-upgrades at the new origin.
+#
+# Does NOT upgrade PHP itself (mitigation / repo fix only).
+#
+# Usage:
+#   ansible-playbook migrate-sury-php-repo.yml -l vmpdcnmscore01
+#   ansible-playbook migrate-sury-php-repo.yml -e target=librenms_nodes
+#
+# Optional extra vars:
+#   force_add_sury=true   add packages.sury.org even if the host has no ondrej PPA today
+
+- name: Migrate ondrej/php PPA to packages.sury.org
+  hosts: "{{ target | default('all') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    sury_keyring_url: https://packages.sury.org/debsuryorg-archive-keyring.deb
+    sury_keyring_path: /usr/share/keyrings/debsuryorg-archive-keyring.gpg
+    sury_source_file: /etc/apt/sources.list.d/php-sury.list
+    uu_conf_new: /etc/apt/apt.conf.d/52unattended-sury-php
+    uu_conf_old:
+      - /etc/apt/apt.conf.d/52unattended-ondrej-php
+    force_add_sury: false
+
+  tasks:
+    # ------------------------------------------------------------------ pre-checks
+    - name: Only run on Ubuntu
+      ansible.builtin.meta: end_host
+      when: ansible_distribution != 'Ubuntu'
+
+    - name: Find ondrej/php PPA source files
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns:
+          - "ondrej-*php*"
+        file_type: file
+      register: ppa_files
+
+    - name: Find any apt source still referencing the ondrej/php PPA
+      ansible.builtin.shell: >
+        grep -rlE 'ppa\.launchpad(content)?\.net/ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+      register: ppa_refs
+      changed_when: false
+      check_mode: false
+
+    - name: Find existing packages.sury.org/php sources
+      ansible.builtin.shell: >
+        grep -rl 'packages.sury.org/php' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+      register: sury_refs_before
+      changed_when: false
+      check_mode: false
+
+    - name: Decide whether this host needs Sury
+      ansible.builtin.set_fact:
+        needs_sury: >-
+          {{ (ppa_files.matched | int > 0)
+             or (ppa_refs.stdout_lines | length > 0)
+             or (sury_refs_before.stdout_lines | length > 0)
+             or (force_add_sury | bool) }}
+
+    - name: Skip hosts that never used the ondrej/Sury PHP repo
+      ansible.builtin.meta: end_host
+      when: not needs_sury | bool
+
+    # ------------------------------------------------------- add packages.sury.org
+    - name: Refresh apt (accept the PPA's changed Label)
+      ansible.builtin.command: apt-get update --allow-releaseinfo-change-label  # noqa: command-instead-of-module
+      changed_when: false
+      failed_when: false
+
+    - name: Add packages.sury.org via the official package
+      when: sury_refs_before.stdout_lines | length == 0
+      block:
+        - name: Install debsuryorg-repository-php
+          ansible.builtin.apt:
+            name: debsuryorg-repository-php
+            state: present
+
+      rescue:
+        - name: Fallback - download Sury archive keyring package
+          ansible.builtin.get_url:
+            url: "{{ sury_keyring_url }}"
+            dest: /tmp/debsuryorg-archive-keyring.deb
+            mode: "0644"
+
+        - name: Fallback - install Sury archive keyring
+          ansible.builtin.apt:
+            deb: /tmp/debsuryorg-archive-keyring.deb
+
+        - name: Fallback - write packages.sury.org source
+          ansible.builtin.copy:
+            dest: "{{ sury_source_file }}"
+            mode: "0644"
+            content: |
+              # Managed by Ansible (migrate-sury-php-repo.yml)
+              deb [signed-by={{ sury_keyring_path }}] https://packages.sury.org/php/ {{ ansible_distribution_release }} main
+
+    # ----------------------------------------------------------- remove the PPA
+    - name: Remove ondrej/php PPA source files (incl. .distUpgrade/.save leftovers)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ ppa_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Re-check for remaining PPA references
+      ansible.builtin.shell: >
+        grep -rlE 'ppa\.launchpad(content)?\.net/ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+      register: ppa_refs_after
+      changed_when: false
+      check_mode: false
+
+    - name: Fail if a PPA reference remains in a file we did not manage
+      ansible.builtin.fail:
+        msg: >-
+          ondrej/php PPA still referenced in: {{ ppa_refs_after.stdout_lines | join(', ') }}.
+          Remove those lines manually (likely /etc/apt/sources.list).
+      when: ppa_refs_after.stdout_lines | length > 0
+
+    - name: Remove old PPA signing key
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/trusted.gpg.d/ondrej-ubuntu-php.gpg
+        - /etc/apt/trusted.gpg.d/ondrej_ubuntu_php.gpg
+        - /etc/apt/keyrings/ondrej-ubuntu-php.gpg
+
+    # ------------------------------------------------------- verify the new repo
+    - name: Find packages.sury.org/php sources after migration
+      ansible.builtin.shell: >
+        grep -rl 'packages.sury.org/php' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+      register: sury_refs_after
+      changed_when: false
+      check_mode: false
+
+    - name: Exactly one packages.sury.org/php source must exist
+      ansible.builtin.assert:
+        that:
+          - sury_refs_after.stdout_lines | length == 1
+        fail_msg: >-
+          Expected one packages.sury.org/php source, found {{ sury_refs_after.stdout_lines | length }}:
+          {{ sury_refs_after.stdout_lines | join(', ') }}. Remove the duplicate to avoid
+          'configured multiple times' warnings.
+        success_msg: "Sury source: {{ sury_refs_after.stdout_lines | join(', ') }}"
+
+    - name: Run apt-get update
+      ansible.builtin.command: apt-get update  # noqa: command-instead-of-module
+      register: apt_update
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Apt-get update must be clean (no errors, no duplicate/warning lines)
+      ansible.builtin.assert:
+        that:
+          - apt_update.rc == 0
+          - apt_update.stdout_lines | select('match', '^(E|W):') | list | length == 0
+          - apt_update.stderr_lines | select('match', '^(E|W):') | list | length == 0
+          - "'packages.sury.org/php' in apt_update.stdout"
+        fail_msg: |
+          apt-get update not clean on {{ inventory_hostname }}:
+          {{ (apt_update.stdout_lines + apt_update.stderr_lines) | select('match', '^(E|W|Err):') | list | join('\n') }}
+        success_msg: "apt-get update clean; packages.sury.org/php fetched"
+
+    - name: Determine origin of packages.sury.org/php
+      ansible.builtin.shell: >
+        set -o pipefail;
+        apt-cache policy | grep -A1 'packages.sury.org/php' | grep -oP '\bo=\K[^,]+' | sort -u
+      args:
+        executable: /bin/bash
+      register: sury_origin
+      changed_when: false
+      check_mode: false
+
+    - name: Origin must be a single value
+      ansible.builtin.assert:
+        that:
+          - sury_origin.stdout_lines | length == 1
+        fail_msg: "Could not determine a single Sury origin: {{ sury_origin.stdout_lines }}"
+        success_msg: "Sury origin: {{ sury_origin.stdout }}"
+
+    - name: Show candidate versions for installed Sury PHP packages
+      ansible.builtin.shell: >
+        set -o pipefail;
+        for p in $(dpkg-query -W -f='${Package} ${Version}\n' 'php*' 2>/dev/null | awk '/sury/{print $1}');
+        do printf '%s ' "$p"; apt-cache policy "$p" | awk '/Installed:|Candidate:/{printf "%s %s  ", $1, $2}'; echo; done
+      args:
+        executable: /bin/bash
+      register: php_candidates
+      changed_when: false
+      check_mode: false
+
+    # ---------------------------------------------------- unattended-upgrades
+    - name: Ensure unattended-upgrades is installed
+      ansible.builtin.apt:
+        name: unattended-upgrades
+        state: present
+
+    - name: Remove old PPA-based unattended-upgrades config
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ uu_conf_old }}"
+
+    - name: Allow packages.sury.org/php in unattended-upgrades
+      ansible.builtin.copy:
+        dest: "{{ uu_conf_new }}"
+        mode: "0644"
+        content: |
+          // Managed by Ansible (migrate-sury-php-repo.yml)
+          Unattended-Upgrade::Origins-Pattern {
+                  "origin={{ sury_origin.stdout }},codename=${distro_codename}";
+          };
+
+    - name: Dry-run unattended-upgrades
+      ansible.builtin.command: unattended-upgrade --dry-run --debug
+      register: uu_dry
+      changed_when: false
+      check_mode: false
+      failed_when: uu_dry.rc != 0
+
+    - name: Unattended-upgrades must list the Sury origin as allowed
+      ansible.builtin.assert:
+        that:
+          - (uu_dry.stdout + uu_dry.stderr) is search('Allowed origins are:.*origin=' ~ (sury_origin.stdout | regex_escape))
+        fail_msg: "Sury origin '{{ sury_origin.stdout }}' not in unattended-upgrades allowed origins"
+        success_msg: "unattended-upgrades will consider origin={{ sury_origin.stdout }}"
+
+    # ------------------------------------------------------------------ summary
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+          - "Removed PPA files: {{ ppa_files.files | map(attribute='path') | list }}"
+          - "Sury source: {{ sury_refs_after.stdout }}"
+          - "Sury origin: {{ sury_origin.stdout }}"
+          - "PHP packages (installed / candidate):"
+          - "{{ php_candidates.stdout_lines }}"
+          - "unattended-upgrades PHP lines:"
+          - "{{ ((uu_dry.stdout_lines + uu_dry.stderr_lines) | select('search', 'php') | list)[:15] }}"
